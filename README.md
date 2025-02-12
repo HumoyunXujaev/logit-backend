@@ -2,6 +2,16 @@
 
 ![Logit Platform](logit\app\blue.png)
 
+for local development u can do ts in order to not install postgres
+```
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+    }
+}
+```
+
 ## Overview
 
 Logit Platform is a comprehensive logistics management system designed to streamline cargo transportation and logistics operations. The platform connects cargo owners, carriers, logistics companies, and logistics students in a unified ecosystem.

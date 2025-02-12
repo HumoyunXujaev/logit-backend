@@ -101,8 +101,8 @@ Logit Platform is a comprehensive logistics management system designed to stream
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/your-username/logit-platform.git
-cd logit-platform/frontend
+git clone https://github.com/HumoyunXujaev/logit-fronttt
+cd logit
 ```
 
 2. Install dependencies:
@@ -124,12 +124,18 @@ NEXT_PUBLIC_TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 npm run dev
 ```
 
+5. setup ngrok (telegram web app doesn't work with localhost):
+```bash
+ngrok http 3000
+```
+
 ### Backend Setup
 
-1. Navigate to backend directory:
+1. Clone the repository:
 
 ```bash
-cd backend
+git clone https://github.com/HumoyunXujaev/logit-backend/
+cd logit_backend
 ```
 
 2. Create virtual environment:
@@ -160,6 +166,10 @@ POSTGRES_PORT=5432
 ```
 
 5. Run migrations:
+   
+```bash
+python manage.py makemigrations
+```
 
 ```bash
 python manage.py migrate
@@ -172,21 +182,6 @@ python manage.py runserver
 ```
 
 ## 🏗 Project Structure
-
-### Frontend Structure
-
-```
-├── app/                 # Next.js app directory
-│   ├── (auth)/         # Authentication pages
-│   ├── cargo/          # Cargo management pages
-│   ├── vehicles/       # Vehicle management pages
-│   ├── components/     # Shared components
-│   ├── contexts/       # React contexts
-│   ├── hooks/          # Custom hooks
-│   └── lib/            # Utilities and API
-├── public/             # Static files
-└── components/         # UI components
-```
 
 ### Backend Structure
 
@@ -341,72 +336,6 @@ POSTGRES_PASSWORD=
 POSTGRES_HOST=
 POSTGRES_PORT=
 ```
-
-## 🚀 Deployment
-
-### Frontend Deployment
-
-1. Build the application:
-
-```bash
-npm run build
-```
-
-2. Start production server:
-
-```bash
-npm start
-```
-
-### Backend Deployment
-
-1. Collect static files:
-
-```bash
-python manage.py collectstatic
-```
-
-2. Configure Gunicorn:
-
-```bash
-gunicorn logit_backend.wsgi:application
-```
-
-3. Set up Nginx as reverse proxy
-
-## 📊 Monitoring
-
-- Application logs
-- Error tracking
-- Performance monitoring
-- User analytics
-- System health checks
-
-## 🔄 Backup & Recovery
-
-- Database backups
-- File system backups
-- Recovery procedures
-- Data retention policies
-
-## 🏆 Best Practices
-
-- Clean code principles
-- Component reusability
-- Type safety
-- Error handling
-- Performance optimization
-- Security measures
-- Documentation
-- Testing
-
-## 🎯 Goals
-
-1. Streamline logistics operations
-2. Connect industry participants
-3. Provide practical training
-4. Ensure safety and compliance
-5. Foster industry growth
 
 ---
 

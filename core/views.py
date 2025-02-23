@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status, permissions
+from rest_framework import viewsets, status, permissions,filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db.models import Q
@@ -15,7 +15,7 @@ from .serializers import (
     SearchFilterUpdateSerializer
 )
 from .permissions import IsVerifiedUser, IsStaffOrReadOnly
-
+ 
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]

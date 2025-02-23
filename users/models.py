@@ -35,18 +35,18 @@ class User(AbstractBaseUser, PermissionsMixin):
         LOGISTICS_COMPANY = 'logistics-company', _('Logistics Company')
         TRANSPORT_COMPANY = 'transport-company', _('Transport Company')
         LOGIT_TRANS = 'logit-trans', _('Logit Trans')
+        MANAGER = 'manager', _('Manager')
 
     class Language(models.TextChoices):
         RUSSIAN = 'ru', _('Russian')
         UZBEK = 'uz', _('Uzbek')
 
-    # Telegram Integration Fields
-    telegram_id = models.CharField(
-        _('Telegram ID'),
-        max_length=100,
-        unique=True,
-        primary_key=True
-    )
+    class StudentTariff(models.TextChoices):
+        STANDARD = 'standard', _('Standard Pro')
+        VIP = 'vip', _('VIP Pro')
+
+    # Basic User Fields
+    telegram_id = models.CharField(_('Telegram ID'), max_length=100, unique=True, primary_key=True)
     first_name = models.CharField(_('First Name'), max_length=255)
     last_name = models.CharField(_('Last Name'), max_length=255, blank=True)
     username = models.CharField(_('Username'), max_length=255, blank=True)
@@ -60,23 +60,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     last_login = models.DateTimeField(_('Last login'), null=True, blank=True)
     
     # Profile Fields
-    type = models.CharField(
-        max_length=20,
-        choices=UserType.choices,
-        null=True,
-        blank=True
-    )
-    role = models.CharField(
-        max_length=20,
-        choices=UserRole.choices,
-        null=True,
-        blank=True
-    )
-    preferred_language = models.CharField(
-        max_length=2,
-        choices=Language.choices,
-        default=Language.RUSSIAN
-    )
+    type = models.CharField(max_length=20, choices=UserType.choices, null=True, blank=True)
+    role = models.CharField(max_length=20, choices=UserRole.choices, null=True, blank=True)
+    preferred_language = models.CharField(max_length=2, choices=Language.choices, default=Language.RUSSIAN)
     
     # Contact Information
     phone_number = models.CharField(max_length=20, null=True, blank=True)
@@ -85,11 +71,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     # Company Information
     company_name = models.CharField(max_length=255, null=True, blank=True)
     position = models.CharField(max_length=100, null=True, blank=True)
-    registration_certificate = models.FileField(
-        upload_to='certificates/',
-        null=True,
-        blank=True
-    )
+    registration_certificate = models.FileField(upload_to='certificates/', null=True, blank=True)
     
     # Student Information
     student_id = models.CharField(max_length=50, null=True, blank=True)
@@ -97,11 +79,19 @@ class User(AbstractBaseUser, PermissionsMixin):
     study_language = models.CharField(max_length=50, null=True, blank=True)
     curator_name = models.CharField(max_length=100, null=True, blank=True)
     end_date = models.DateField(null=True, blank=True)
+    tariff = models.CharField(max_length=20, choices=StudentTariff.choices, null=True, blank=True)
 
-    # Verification
+    # Verification Fields
     verification_date = models.DateTimeField(null=True, blank=True)
     verification_status = models.CharField(max_length=50, null=True, blank=True)
     verification_notes = models.TextField(null=True, blank=True)
+    verified_by = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='verified_users'
+    )
     
     # Rating
     rating = models.DecimalField(
@@ -114,9 +104,6 @@ class User(AbstractBaseUser, PermissionsMixin):
         ]
     )
 
-    # History
-    history = HistoricalRecords()
-
     objects = CustomUserManager()
 
     USERNAME_FIELD = 'telegram_id'
@@ -126,11 +113,6 @@ class User(AbstractBaseUser, PermissionsMixin):
         verbose_name = _('user')
         verbose_name_plural = _('users')
         ordering = ['-date_joined']
-        indexes = [
-            models.Index(fields=['telegram_id']),
-            models.Index(fields=['role']),
-            models.Index(fields=['type']),
-        ]
 
     def __str__(self):
         return f"{self.get_full_name()} ({self.telegram_id})"

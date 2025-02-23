@@ -84,15 +84,87 @@ class CarrierRequest(models.Model):
     def __str__(self):
         return f"Request from {self.carrier.get_full_name()} ({self.loading_point} - {self.unloading_point})"
 
+    def notify_users(self, recipients, message):
+        """Send notification to multiple users"""
+        from core.services.telegram import telegram_service
+        
+        # Create list of (chat_id, message) tuples for users with telegram_id
+        messages = [
+            (user.telegram_id, message)
+            for user in recipients
+            if user.telegram_id
+        ]
+        
+        # Send messages if we have any recipients
+        if messages:
+            telegram_service.send_bulk_messages(messages)
+
+    def save(self, *args, **kwargs):
+        """Override save to handle notifications"""
+        is_new = not self.pk
+        if not is_new:
+            old_status = CarrierRequest.objects.get(pk=self.pk).status
+            status_changed = old_status != self.status
+        else:
+            status_changed = False
+            
+        super().save(*args, **kwargs)
+        
+        # Get notification service
+        from core.services.telegram import telegram_service
+        
+        if is_new:
+            # Notify students about new carrier request
+            students = User.objects.filter(role='student', is_active=True)
+            message = telegram_service.format_carrier_notification(
+                self,
+                "Новая заявка от перевозчика"
+            )
+            self.notify_users(students, message)
+                        
+        elif status_changed:
+            # Send notifications based on new status
+            message = telegram_service.format_carrier_notification(
+                self,
+                f"Статус заявки изменен на {self.get_status_display()}"
+            )
+            recipients = []
+            
+            if self.status == self.RequestStatus.ASSIGNED:
+                # Notify carrier about assignment
+                recipients = [self.carrier]
+                
+            elif self.status in [self.RequestStatus.ACCEPTED, self.RequestStatus.REJECTED]:
+                # Notify assigning student
+                if self.assigned_by:
+                    recipients = [self.assigned_by]
+                    
+                # Also notify cargo owner if request was accepted
+                if self.status == self.RequestStatus.ACCEPTED and self.assigned_cargo:
+                    recipients.append(self.assigned_cargo.owner)
+            
+            elif self.status == self.RequestStatus.COMPLETED:
+                # Notify carrier and cargo owner
+                recipients = [self.carrier]
+                if self.assigned_cargo:
+                    recipients.append(self.assigned_cargo.owner)
+            
+            if recipients:
+                self.notify_users(recipients, message)
+
+
 class Cargo(models.Model):
     class CargoStatus(models.TextChoices):
-        DRAFT = 'draft', _('Draft')
-        PENDING = 'pending', _('Pending Assignment')
-        ASSIGNED = 'assigned', _('Assigned to Carrier')
-        IN_PROGRESS = 'in_progress', _('In Progress')
-        COMPLETED = 'completed', _('Completed')
-        CANCELLED = 'cancelled', _('Cancelled')
-        EXPIRED = 'expired', _('Expired')
+            DRAFT = 'draft', _('Draft')
+            PENDING_APPROVAL = 'pending_approval', _('Pending Manager Approval')
+            MANAGER_APPROVED = 'manager_approved', _('Approved by Manager')
+            PENDING = 'pending', _('Pending Assignment')
+            ASSIGNED = 'assigned', _('Assigned to Carrier')
+            IN_PROGRESS = 'in_progress', _('In Progress')
+            COMPLETED = 'completed', _('Completed')
+            CANCELLED = 'cancelled', _('Cancelled')
+            REJECTED = 'rejected', _('Rejected by Manager')
+            EXPIRED = 'expired', _('Expired')
 
     class PaymentMethod(models.TextChoices):
         CASH = 'cash', _('Cash')
@@ -115,6 +187,12 @@ class Cargo(models.Model):
         TOP = 'top', _('Top Loading')
         HYDRO_BOARD = 'hydro_board', _('Hydro Board')
 
+    class SourceType(models.TextChoices):
+        TELEGRAM = 'telegram', _('Telegram')
+        API = 'api', _('External API')
+        MANUAL = 'manual', _('Manual Entry')
+        WEBSITE = 'website', _('Website')
+        
     # Basic cargo information
     title = models.CharField(max_length=255)
     description = models.TextField()
@@ -221,9 +299,134 @@ class Cargo(models.Model):
     views_count = models.PositiveIntegerField(default=0)
     
     # Source information 
-    source_type = models.CharField(max_length=50, null=True, blank=True)
-    source_id = models.CharField(max_length=100, null=True, blank=True)
+    source_type = models.CharField(
+        max_length=20,
+        choices=SourceType.choices,
+        default=SourceType.MANUAL
+    )
+    source_id = models.CharField(max_length=255, null=True, blank=True)
+    approved_by = models.ForeignKey(
+            User,
+            on_delete=models.SET_NULL,
+            null=True,
+            blank=True,
+            related_name='approved_cargos',
+            limit_choices_to={'role': 'manager'}
+        )
+    approval_date = models.DateTimeField(null=True, blank=True)
+    approval_notes = models.TextField(null=True, blank=True)
     
+    def notify_users(self, recipients, message):
+        """Send notification to multiple users"""
+        from core.services.telegram import telegram_service
+        
+        # Create list of (chat_id, message) tuples for users with telegram_id
+        messages = [
+            (user.telegram_id, message)
+            for user in recipients
+            if user.telegram_id
+        ]
+        
+        # Send messages if we have any recipients
+        if messages:
+            telegram_service.send_bulk_messages(messages)
+
+    def save(self, *args, **kwargs):
+        """Override save to handle volume calculation and notifications"""
+        if all([self.length, self.width, self.height]):
+            self.volume = self.length * self.width * self.height
+            
+        # Check if this is a new cargo or status has changed
+        is_new = not self.pk
+        if not is_new:
+            old_status = Cargo.objects.get(pk=self.pk).status
+            status_changed = old_status != self.status
+        else:
+            status_changed = False
+
+        if self.approved_by and not self.approval_date:
+            self.approval_date = timezone.now()
+            
+        super().save(*args, **kwargs)
+        
+        # Get notification service
+        from core.services.telegram import telegram_service
+        
+        if is_new:
+            # Notify managers about new cargo requiring approval
+            if self.status == self.CargoStatus.PENDING_APPROVAL:
+                managers = User.objects.filter(role='manager', is_active=True)
+                message = telegram_service.format_cargo_notification(
+                    self,
+                    f"Новый груз требует проверки: {self.title}"
+                )
+                self.notify_users(managers, message)
+                        
+        elif status_changed:
+            # Send notifications based on new status
+            message = telegram_service.format_cargo_notification(
+                self,
+                f"Статус груза изменен на {self.get_status_display()}: {self.title}"
+            )
+            recipients = []
+            
+            if self.status == self.CargoStatus.MANAGER_APPROVED:
+                # Notify students about approved cargo
+                recipients = User.objects.filter(role='student', is_active=True)
+                
+            elif self.status == self.CargoStatus.ASSIGNED:
+                # Notify assigned carrier
+                if self.assigned_to:
+                    recipients = [self.assigned_to]
+            
+            elif self.status in [self.CargoStatus.COMPLETED, self.CargoStatus.CANCELLED]:
+                # Notify owner and manager
+                recipients = [self.owner]
+                if self.approved_by:
+                    recipients.append(self.approved_by)
+            
+            if recipients:
+                self.notify_users(recipients, message)
+
+    def approve(self, manager: User, notes: str = None):
+        """Approve cargo by manager"""
+        if manager.role != 'manager':
+            raise ValueError("Only managers can approve cargos")
+            
+        self.status = self.CargoStatus.MANAGER_APPROVED
+        self.approved_by = manager
+        self.approval_notes = notes
+        self.approval_date = timezone.now()
+        self.save()
+        
+        # Notify owner about approval
+        from core.services.telegram import telegram_service
+        message = telegram_service.format_cargo_notification(
+            self,
+            "Ваш груз был одобрен"
+        )
+        self.notify_users([self.owner], message)
+
+    def reject(self, manager: User, notes: str = None):
+        """Reject cargo by manager"""
+        if manager.role != 'manager':
+            raise ValueError("Only managers can reject cargos")
+            
+        self.status = self.CargoStatus.REJECTED
+        self.approved_by = manager
+        self.approval_notes = notes
+        self.approval_date = timezone.now()
+        self.save()
+        
+        # Notify owner about rejection
+        from core.services.telegram import telegram_service
+        message = telegram_service.format_cargo_notification(
+            self,
+            f"Ваш груз был отклонен\nПричина: {notes if notes else 'Не указана'}"
+        )
+        self.notify_users([self.owner], message)
+
+
     class Meta:
         ordering = ['-created_at']
         indexes = [
@@ -240,16 +443,13 @@ class Cargo(models.Model):
         
     def __str__(self):
         return f"{self.title} ({self.loading_point} - {self.unloading_point})"
+    
     def increment_views(self):
         """Increment the view counter"""
         self.views_count += 1
         self.save(update_fields=['views_count'])
+
     
-    def save(self, *args, **kwargs):
-        """Calculate volume if dimensions are provided"""
-        if all([self.length, self.width, self.height]):
-            self.volume = self.length * self.width * self.height
-        super().save(*args, **kwargs)
 
 class CargoDocument(models.Model):
     """Model for storing cargo-related documents"""
@@ -302,3 +502,25 @@ class CargoStatusHistory(models.Model):
         
     def __str__(self):
         return f"{self.cargo.title} - {self.status} at {self.changed_at}"
+    
+    def save(self, *args, **kwargs):
+        """Override save to send notifications"""
+        is_new = not self.pk
+        super().save(*args, **kwargs)
+        
+        if is_new:
+            # Send notification about status change
+            from core.services.telegram import telegram_service
+            message = (
+                f"Cargo status updated to {self.get_status_display()}\n"
+                f"Cargo: {self.cargo.title}\n"
+                f"Changed by: {self.changed_by.get_full_name() if self.changed_by else 'System'}\n"
+                f"Comment: {self.comment if self.comment else 'No comment'}"
+            )
+            
+            # Notify cargo owner
+            if self.cargo.owner.telegram_id:
+                telegram_service.send_message(
+                    self.cargo.owner.telegram_id,
+                    message
+                )

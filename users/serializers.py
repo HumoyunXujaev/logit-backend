@@ -91,7 +91,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'company_name', 'position', 'student_id', 'group_name',
             'study_language', 'curator_name', 'end_date', 'rating',
             'rating_count', 'is_verified', 'verification_date',
-            'documents', 'date_joined', 'last_login'
+            'documents', 'date_joined', 'last_login', 'tariff'
         ]
         read_only_fields = [
             'telegram_id', 'rating', 'is_verified',
@@ -115,7 +115,7 @@ class UserUpdateSerializer(serializers.ModelSerializer):
             'phone_number', 'whatsapp_number', 'preferred_language',
             'company_name', 'position', 'type', 'role',
             'student_id', 'group_name', 'study_language',
-            'curator_name', 'end_date'
+            'curator_name', 'end_date', 'tariff'
         ]
     
     def validate(self, data):

@@ -18,17 +18,162 @@ from .serializers import (
     CarrierRequestSerializer,
     CarrierRequestListSerializer,
     CarrierRequestCreateSerializer,
-    CarrierRequestUpdateSerializer
+    CarrierRequestUpdateSerializer,
+    ManagerCargoUpdateSerializer,
+    ExternalCargoCreateSerializer
 )
 from .filters import CargoFilter
 from core.permissions import (
     IsVerifiedUser,
+    IsManager,
     IsObjectOwner,
+    isStudent,
     IsCarrier,
     IsLogisticsCompany,
     IsCargoOwner
 )
 
+class ManagerCargoViewSet(viewsets.ModelViewSet):
+    """ViewSet for manager operations on cargo"""
+    permission_classes = [permissions.IsAuthenticated, IsManager]
+    serializer_class = ManagerCargoUpdateSerializer
+
+    def get_queryset(self):
+        """Filter queryset to show relevant cargos for managers"""
+        return Cargo.objects.filter(
+            Q(status=Cargo.CargoStatus.PENDING_APPROVAL) |
+            Q(approved_by=self.request.user) |
+            Q(status=Cargo.CargoStatus.MANAGER_APPROVED)
+        ).order_by('-created_at')
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        """Approve a cargo"""
+        cargo = self.get_object()
+        serializer = CargoApprovalSerializer(
+            data=request.data,
+            context={'request': request}
+        )
+        
+        if serializer.is_valid():
+            try:
+                cargo.approve(
+                    manager=request.user,
+                    notes=serializer.validated_data.get('approval_notes')
+                )
+                return Response(
+                    {'status': 'Cargo approved successfully'},
+                    status=status.HTTP_200_OK
+                )
+            except ValueError as e:
+                return Response(
+                    {'error': str(e)},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """Reject a cargo"""
+        cargo = self.get_object()
+        serializer = CargoApprovalSerializer(
+            data=request.data,
+            context={'request': request}
+        )
+        
+        if serializer.is_valid():
+            try:
+                cargo.reject(
+                    manager=request.user,
+                    notes=serializer.validated_data.get('approval_notes')
+                )
+                return Response(
+                    {'status': 'Cargo rejected successfully'},
+                    status=status.HTTP_200_OK
+                )
+            except ValueError as e:
+                return Response(
+                    {'error': str(e)},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    @action(detail=False, methods=['get'])
+    def pending_approval(self, request):
+        """Get cargos pending manager approval"""
+        queryset = self.get_queryset().filter(
+            status=Cargo.CargoStatus.PENDING_APPROVAL
+        )
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def approved(self, request):
+        """Get cargos approved by the current manager"""
+        queryset = self.get_queryset().filter(
+            status=Cargo.CargoStatus.MANAGER_APPROVED,
+            approved_by=request.user
+        )
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+    
+class ExternalCargoViewSet(viewsets.GenericViewSet):
+    """ViewSet for external cargo creation"""
+    permission_classes = [permissions.AllowAny]
+    serializer_class = ExternalCargoCreateSerializer
+
+    @action(detail=False, methods=['post'])
+    def create_external(self, request):
+        """
+        Create a cargo from external source (Telegram/API)
+        Requires valid API key for authentication
+        """
+        serializer = self.get_serializer(data=request.data)
+        
+        try:
+            serializer.is_valid(raise_exception=True)
+            
+            # Get or create system user for external cargos
+            system_user, _ = User.objects.get_or_create(
+                username='system',
+                defaults={
+                    'first_name': 'System',
+                    'is_active': True,
+                    'is_verified': True,
+                    'role': 'logistics-company'
+                }
+            )
+            
+            # Create cargo with system user as owner
+            cargo = Cargo.objects.create(
+                owner=system_user,
+                **serializer.validated_data
+            )
+            
+            return Response(
+                {
+                    'id': cargo.id,
+                    'status': 'success',
+                    'message': 'Cargo created successfully'
+                },
+                status=status.HTTP_201_CREATED
+            )
+            
+        except Exception as e:
+            return Response(
+                {
+                    'status': 'error',
+                    'message': str(e)
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
 class CarrierRequestViewSet(viewsets.ModelViewSet):
     """ViewSet for carrier requests"""
     queryset = CarrierRequest.objects.all()
@@ -123,22 +268,46 @@ class CargoViewSet(viewsets.ModelViewSet):
         user = self.request.user
 
         if user.role == 'carrier':
-            # Carriers see pending cargos and ones assigned to them
+            # Carriers see pending and assigned cargos
             return queryset.filter(
-                Q(status='pending') |
+                Q(status=Cargo.CargoStatus.PENDING) |
                 Q(assigned_to=user)
             )
         elif user.role == 'student':
-            # Students see pending cargos and ones they manage
-            return queryset.filter(
+            # Students see manager-approved cargos
+            # VIP students see all approved cargos, standard students see limited ones
+            base_query = Q(status=Cargo.CargoStatus.MANAGER_APPROVED)
+            if user.tariff == 'standard':
+                 return queryset.filter(
                 Q(status='pending') |
-                Q(managed_by=user)
+                Q(managed_by=user) | 
+                Q(owner=user)
             )
-        elif user.role in ['cargo-owner', 'logistics-company']:
+            if user.tariff == 'vip':
+                return queryset.filter(
+                Q(status='pending') |
+                Q(managed_by=user) | 
+                Q(owner=user) | 
+                Q(status=Cargo.CargoStatus.MANAGER_APPROVED)
+            )
+                # return queryset.filter(base_query)
+            
+            else:
+                return queryset.none()
+
+        elif user.role == 'cargo-owner':
             # Owners see their own cargos
             return queryset.filter(owner=user)
+        elif user.role == 'logistics-company':
+            # Companies see their own cargos
+            return queryset.filter(owner=user)
+        elif user.role == 'manager':
+            # Managers see all cargos
+            return queryset
         elif user.is_staff:
             return queryset
+            
+        return queryset.none()
             
         return queryset.none()
     
@@ -161,7 +330,7 @@ class CargoViewSet(viewsets.ModelViewSet):
         if self.action == 'create':
             permission_classes = [
                 IsVerifiedUser,
-                (IsCargoOwner | IsLogisticsCompany)
+                (IsCargoOwner | IsLogisticsCompany | isStudent)
             ]
         elif self.action in ['update', 'partial_update', 'destroy']:
             permission_classes = [IsVerifiedUser, IsObjectOwner]
@@ -230,22 +399,44 @@ class CargoViewSet(viewsets.ModelViewSet):
         )
 
     def perform_create(self, serializer):
-        """Create a new cargo and notify relevant users"""
+        """Create cargo and handle notifications"""
         cargo = serializer.save(owner=self.request.user)
+
+        # Create notifications based on cargo status
+        if cargo.status == Cargo.CargoStatus.PENDING_APPROVAL:
+            self.notify_managers(cargo)
+        elif cargo.status == Cargo.CargoStatus.MANAGER_APPROVED:
+            self.notify_students(cargo)
+
+    def notify_managers(self, cargo):
+        """Notify managers about new cargo requiring approval"""
+        from core.models import Notification
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
         
-        # Create notification for logistics students if cargo needs assignment
-        if cargo.status == 'pending':
-            from core.models import Notification
-            # Get all logistics students
-            students = User.objects.filter(role='student', is_active=True)
-            
-            for student in students:
-                Notification.objects.create(
-                    user=student,
-                    type='cargo',
-                    message=f'New cargo available: {cargo.title} ({cargo.loading_point} - {cargo.unloading_point})',
-                    content_object=cargo
-                )
+        managers = User.objects.filter(role='manager', is_active=True)
+        for manager in managers:
+            Notification.objects.create(
+                user=manager,
+                type='cargo',
+                message=f'New cargo requires approval: {cargo.title}',
+                content_object=cargo
+            )
+
+    def notify_students(self, cargo):
+        """Notify students about new approved cargo"""
+        from core.models import Notification
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        
+        students = User.objects.filter(role='student', is_active=True)
+        for student in students:
+            Notification.objects.create(
+                user=student,
+                type='cargo',
+                message=f'New cargo available: {cargo.title}',
+                content_object=cargo
+            )
 
     def perform_update(self, serializer):
         """Update cargo and handle notifications"""

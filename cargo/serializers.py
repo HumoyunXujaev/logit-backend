@@ -4,7 +4,99 @@ from .models import CargoStatusHistory
 from users.serializers import UserProfileSerializer
 from .models import Cargo, CarrierRequest, CargoDocument
 from vehicles.serializers import VehicleSerializer
+from django.conf import settings
 
+class CargoApprovalSerializer(serializers.ModelSerializer):
+    """Serializer for manager approval/rejection of cargo"""
+    approval_notes = serializers.CharField(required=False, allow_blank=True)
+    
+    class Meta:
+        model = Cargo
+        fields = ['approval_notes']
+
+    def validate(self, data):
+        user = self.context['request'].user
+        if user.role != 'manager':
+            raise serializers.ValidationError(
+                "Only managers can perform this action"
+            )
+        return data
+
+class ManagerCargoUpdateSerializer(serializers.ModelSerializer):
+    """Serializer for managers to update cargo details"""
+    class Meta:
+        model = Cargo
+        fields = [
+            'title', 'description', 'weight',
+            'volume', 'length', 'width', 'height',
+            'loading_point', 'unloading_point',
+            'additional_points', 'loading_date',
+            'is_constant', 'is_ready', 'vehicle_type',
+            'loading_type', 'payment_method', 'price',
+            'payment_details', 'status'
+        ]
+
+    def validate_status(self, value):
+        if value not in [
+            Cargo.CargoStatus.MANAGER_APPROVED,
+            Cargo.CargoStatus.REJECTED,
+            Cargo.CargoStatus.PENDING
+        ]:
+            raise serializers.ValidationError(
+                "Invalid status for manager update"
+            )
+        return value
+
+    def validate(self, data):
+        user = self.context['request'].user
+        if user.role != 'manager':
+            raise serializers.ValidationError(
+                "Only managers can update cargo details"
+            )
+        return data
+    
+class ExternalCargoCreateSerializer(serializers.ModelSerializer):
+    """Serializer for external cargo creation with API key validation"""
+    api_key = serializers.CharField(write_only=True)
+    source_type = serializers.ChoiceField(choices=Cargo.SourceType.choices)
+    source_id = serializers.CharField(required=True)
+
+    class Meta:
+        model = Cargo
+        fields = [
+            'title', 'description', 'weight',
+            'volume', 'length', 'width', 'height',
+            'loading_point', 'unloading_point',
+            'additional_points', 'loading_date',
+            'is_constant', 'is_ready', 'vehicle_type',
+            'loading_type', 'payment_method', 'price',
+            'payment_details', 'source_type', 'source_id',
+            'api_key'
+        ]
+
+    def validate_api_key(self, value):
+        """Validate the API key against the configured value"""
+        valid_key = getattr(settings, 'EXTERNAL_API_KEY', None)
+        if not valid_key:
+            raise serializers.ValidationError(
+                "API key validation is not configured"
+            )
+        
+        if value != valid_key:
+            raise serializers.ValidationError("Invalid API key")
+        
+        return value
+
+    def validate(self, data):
+        """Additional validation for the complete cargo data"""
+        # Remove api_key from data before saving
+        data.pop('api_key', None)
+        
+        # Set status to pending for external cargos
+        data['status'] = 'pending'
+        
+        return data
+    
 class CargoDocumentSerializer(serializers.ModelSerializer):
     class Meta:
         model = CargoDocument
@@ -122,7 +214,7 @@ class CargoSerializer(serializers.ModelSerializer):
     assigned_to = UserProfileSerializer(read_only=True)
     managed_by = UserProfileSerializer(read_only=True)
     carrier_requests = CarrierRequestListSerializer(many=True, read_only=True)
-    
+
     class Meta:
         model = Cargo
         fields = [
@@ -181,26 +273,49 @@ class CargoCreateSerializer(serializers.ModelSerializer):
     #         **validated_data
     #     )
 
-    def create(self, validated_data):
-        """Create cargo with default status based on user role"""
-        user = self.context['request'].user
+    # def create(self, validated_data):
+    #     """Create cargo with default status based on user role"""
+    #     user = self.context['request'].user
         
+    #     # Set initial status based on user role
+    #     if user.role == 'cargo-owner':
+    #         status = 'draft'  # Needs manager approval
+    #     elif user.role == 'logistics-company':
+    #         status = 'pending'  # Goes directly to students
+    #     else:
+    #         status = 'draft'  # Default status
+            
+    #     print(validated_data)
+    #     print(user)
+    #     validated_data.pop('owner', None)
+    #     return Cargo.objects.create(
+    #         owner=user,
+    #         status=status,
+    #         **validated_data
+    #     )
+    def create(self, validated_data):
+        """Create cargo with appropriate initial status based on user role"""
+        request = self.context.get('request')
+        user = request.user if request else None
+
+        if not user:
+            raise serializers.ValidationError("User is required")
+
         # Set initial status based on user role
         if user.role == 'cargo-owner':
-            status = 'draft'  # Needs manager approval
+            # Cargo owners' submissions need manager approval
+            validated_data['status'] = Cargo.CargoStatus.PENDING_APPROVAL
         elif user.role == 'logistics-company':
-            status = 'pending'  # Goes directly to students
+            # Logistics companies' submissions go directly to pending
+            validated_data['status'] = Cargo.CargoStatus.PENDING
+        elif user.role == 'manager':
+            # Managers' submissions are automatically approved
+            validated_data['status'] = Cargo.CargoStatus.MANAGER_APPROVED
+            validated_data['approved_by'] = user
         else:
-            status = 'draft'  # Default status
-            
-        print(validated_data)
-        print(user)
-        validated_data.pop('owner', None)
-        return Cargo.objects.create(
-            owner=user,
-            status=status,
-            **validated_data
-        )
+            validated_data['status'] = Cargo.CargoStatus.DRAFT
+
+        return super().create(validated_data)
     
 class CargoUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating cargo"""

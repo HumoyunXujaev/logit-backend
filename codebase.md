@@ -387,15 +387,87 @@ class CarrierRequest(models.Model):
     def __str__(self):
         return f"Request from {self.carrier.get_full_name()} ({self.loading_point} - {self.unloading_point})"
 
+    def notify_users(self, recipients, message):
+        """Send notification to multiple users"""
+        from core.services.telegram import telegram_service
+        
+        # Create list of (chat_id, message) tuples for users with telegram_id
+        messages = [
+            (user.telegram_id, message)
+            for user in recipients
+            if user.telegram_id
+        ]
+        
+        # Send messages if we have any recipients
+        if messages:
+            telegram_service.send_bulk_messages(messages)
+
+    def save(self, *args, **kwargs):
+        """Override save to handle notifications"""
+        is_new = not self.pk
+        if not is_new:
+            old_status = CarrierRequest.objects.get(pk=self.pk).status
+            status_changed = old_status != self.status
+        else:
+            status_changed = False
+            
+        super().save(*args, **kwargs)
+        
+        # Get notification service
+        from core.services.telegram import telegram_service
+        
+        if is_new:
+            # Notify students about new carrier request
+            students = User.objects.filter(role='student', is_active=True)
+            message = telegram_service.format_carrier_notification(
+                self,
+                "Новая заявка от перевозчика"
+            )
+            self.notify_users(students, message)
+                        
+        elif status_changed:
+            # Send notifications based on new status
+            message = telegram_service.format_carrier_notification(
+                self,
+                f"Статус заявки изменен на {self.get_status_display()}"
+            )
+            recipients = []
+            
+            if self.status == self.RequestStatus.ASSIGNED:
+                # Notify carrier about assignment
+                recipients = [self.carrier]
+                
+            elif self.status in [self.RequestStatus.ACCEPTED, self.RequestStatus.REJECTED]:
+                # Notify assigning student
+                if self.assigned_by:
+                    recipients = [self.assigned_by]
+                    
+                # Also notify cargo owner if request was accepted
+                if self.status == self.RequestStatus.ACCEPTED and self.assigned_cargo:
+                    recipients.append(self.assigned_cargo.owner)
+            
+            elif self.status == self.RequestStatus.COMPLETED:
+                # Notify carrier and cargo owner
+                recipients = [self.carrier]
+                if self.assigned_cargo:
+                    recipients.append(self.assigned_cargo.owner)
+            
+            if recipients:
+                self.notify_users(recipients, message)
+
+
 class Cargo(models.Model):
     class CargoStatus(models.TextChoices):
-        DRAFT = 'draft', _('Draft')
-        PENDING = 'pending', _('Pending Assignment')
-        ASSIGNED = 'assigned', _('Assigned to Carrier')
-        IN_PROGRESS = 'in_progress', _('In Progress')
-        COMPLETED = 'completed', _('Completed')
-        CANCELLED = 'cancelled', _('Cancelled')
-        EXPIRED = 'expired', _('Expired')
+            DRAFT = 'draft', _('Draft')
+            PENDING_APPROVAL = 'pending_approval', _('Pending Manager Approval')
+            MANAGER_APPROVED = 'manager_approved', _('Approved by Manager')
+            PENDING = 'pending', _('Pending Assignment')
+            ASSIGNED = 'assigned', _('Assigned to Carrier')
+            IN_PROGRESS = 'in_progress', _('In Progress')
+            COMPLETED = 'completed', _('Completed')
+            CANCELLED = 'cancelled', _('Cancelled')
+            REJECTED = 'rejected', _('Rejected by Manager')
+            EXPIRED = 'expired', _('Expired')
 
     class PaymentMethod(models.TextChoices):
         CASH = 'cash', _('Cash')
@@ -418,6 +490,12 @@ class Cargo(models.Model):
         TOP = 'top', _('Top Loading')
         HYDRO_BOARD = 'hydro_board', _('Hydro Board')
 
+    class SourceType(models.TextChoices):
+        TELEGRAM = 'telegram', _('Telegram')
+        API = 'api', _('External API')
+        MANUAL = 'manual', _('Manual Entry')
+        WEBSITE = 'website', _('Website')
+        
     # Basic cargo information
     title = models.CharField(max_length=255)
     description = models.TextField()
@@ -524,9 +602,134 @@ class Cargo(models.Model):
     views_count = models.PositiveIntegerField(default=0)
     
     # Source information 
-    source_type = models.CharField(max_length=50, null=True, blank=True)
-    source_id = models.CharField(max_length=100, null=True, blank=True)
+    source_type = models.CharField(
+        max_length=20,
+        choices=SourceType.choices,
+        default=SourceType.MANUAL
+    )
+    source_id = models.CharField(max_length=255, null=True, blank=True)
+    approved_by = models.ForeignKey(
+            User,
+            on_delete=models.SET_NULL,
+            null=True,
+            blank=True,
+            related_name='approved_cargos',
+            limit_choices_to={'role': 'manager'}
+        )
+    approval_date = models.DateTimeField(null=True, blank=True)
+    approval_notes = models.TextField(null=True, blank=True)
     
+    def notify_users(self, recipients, message):
+        """Send notification to multiple users"""
+        from core.services.telegram import telegram_service
+        
+        # Create list of (chat_id, message) tuples for users with telegram_id
+        messages = [
+            (user.telegram_id, message)
+            for user in recipients
+            if user.telegram_id
+        ]
+        
+        # Send messages if we have any recipients
+        if messages:
+            telegram_service.send_bulk_messages(messages)
+
+    def save(self, *args, **kwargs):
+        """Override save to handle volume calculation and notifications"""
+        if all([self.length, self.width, self.height]):
+            self.volume = self.length * self.width * self.height
+            
+        # Check if this is a new cargo or status has changed
+        is_new = not self.pk
+        if not is_new:
+            old_status = Cargo.objects.get(pk=self.pk).status
+            status_changed = old_status != self.status
+        else:
+            status_changed = False
+
+        if self.approved_by and not self.approval_date:
+            self.approval_date = timezone.now()
+            
+        super().save(*args, **kwargs)
+        
+        # Get notification service
+        from core.services.telegram import telegram_service
+        
+        if is_new:
+            # Notify managers about new cargo requiring approval
+            if self.status == self.CargoStatus.PENDING_APPROVAL:
+                managers = User.objects.filter(role='manager', is_active=True)
+                message = telegram_service.format_cargo_notification(
+                    self,
+                    f"Новый груз требует проверки: {self.title}"
+                )
+                self.notify_users(managers, message)
+                        
+        elif status_changed:
+            # Send notifications based on new status
+            message = telegram_service.format_cargo_notification(
+                self,
+                f"Статус груза изменен на {self.get_status_display()}: {self.title}"
+            )
+            recipients = []
+            
+            if self.status == self.CargoStatus.MANAGER_APPROVED:
+                # Notify students about approved cargo
+                recipients = User.objects.filter(role='student', is_active=True)
+                
+            elif self.status == self.CargoStatus.ASSIGNED:
+                # Notify assigned carrier
+                if self.assigned_to:
+                    recipients = [self.assigned_to]
+            
+            elif self.status in [self.CargoStatus.COMPLETED, self.CargoStatus.CANCELLED]:
+                # Notify owner and manager
+                recipients = [self.owner]
+                if self.approved_by:
+                    recipients.append(self.approved_by)
+            
+            if recipients:
+                self.notify_users(recipients, message)
+
+    def approve(self, manager: User, notes: str = None):
+        """Approve cargo by manager"""
+        if manager.role != 'manager':
+            raise ValueError("Only managers can approve cargos")
+            
+        self.status = self.CargoStatus.MANAGER_APPROVED
+        self.approved_by = manager
+        self.approval_notes = notes
+        self.approval_date = timezone.now()
+        self.save()
+        
+        # Notify owner about approval
+        from core.services.telegram import telegram_service
+        message = telegram_service.format_cargo_notification(
+            self,
+            "Ваш груз был одобрен"
+        )
+        self.notify_users([self.owner], message)
+
+    def reject(self, manager: User, notes: str = None):
+        """Reject cargo by manager"""
+        if manager.role != 'manager':
+            raise ValueError("Only managers can reject cargos")
+            
+        self.status = self.CargoStatus.REJECTED
+        self.approved_by = manager
+        self.approval_notes = notes
+        self.approval_date = timezone.now()
+        self.save()
+        
+        # Notify owner about rejection
+        from core.services.telegram import telegram_service
+        message = telegram_service.format_cargo_notification(
+            self,
+            f"Ваш груз был отклонен\nПричина: {notes if notes else 'Не указана'}"
+        )
+        self.notify_users([self.owner], message)
+
+
     class Meta:
         ordering = ['-created_at']
         indexes = [
@@ -543,16 +746,13 @@ class Cargo(models.Model):
         
     def __str__(self):
         return f"{self.title} ({self.loading_point} - {self.unloading_point})"
+    
     def increment_views(self):
         """Increment the view counter"""
         self.views_count += 1
         self.save(update_fields=['views_count'])
+
     
-    def save(self, *args, **kwargs):
-        """Calculate volume if dimensions are provided"""
-        if all([self.length, self.width, self.height]):
-            self.volume = self.length * self.width * self.height
-        super().save(*args, **kwargs)
 
 class CargoDocument(models.Model):
     """Model for storing cargo-related documents"""
@@ -605,6 +805,28 @@ class CargoStatusHistory(models.Model):
         
     def __str__(self):
         return f"{self.cargo.title} - {self.status} at {self.changed_at}"
+    
+    def save(self, *args, **kwargs):
+        """Override save to send notifications"""
+        is_new = not self.pk
+        super().save(*args, **kwargs)
+        
+        if is_new:
+            # Send notification about status change
+            from core.services.telegram import telegram_service
+            message = (
+                f"Cargo status updated to {self.get_status_display()}\n"
+                f"Cargo: {self.cargo.title}\n"
+                f"Changed by: {self.changed_by.get_full_name() if self.changed_by else 'System'}\n"
+                f"Comment: {self.comment if self.comment else 'No comment'}"
+            )
+            
+            # Notify cargo owner
+            if self.cargo.owner.telegram_id:
+                telegram_service.send_message(
+                    self.cargo.owner.telegram_id,
+                    message
+                )
 ```
 
 # cargo\serializers.py
@@ -616,7 +838,99 @@ from .models import CargoStatusHistory
 from users.serializers import UserProfileSerializer
 from .models import Cargo, CarrierRequest, CargoDocument
 from vehicles.serializers import VehicleSerializer
+from django.conf import settings
 
+class CargoApprovalSerializer(serializers.ModelSerializer):
+    """Serializer for manager approval/rejection of cargo"""
+    approval_notes = serializers.CharField(required=False, allow_blank=True)
+    
+    class Meta:
+        model = Cargo
+        fields = ['approval_notes']
+
+    def validate(self, data):
+        user = self.context['request'].user
+        if user.role != 'manager':
+            raise serializers.ValidationError(
+                "Only managers can perform this action"
+            )
+        return data
+
+class ManagerCargoUpdateSerializer(serializers.ModelSerializer):
+    """Serializer for managers to update cargo details"""
+    class Meta:
+        model = Cargo
+        fields = [
+            'title', 'description', 'weight',
+            'volume', 'length', 'width', 'height',
+            'loading_point', 'unloading_point',
+            'additional_points', 'loading_date',
+            'is_constant', 'is_ready', 'vehicle_type',
+            'loading_type', 'payment_method', 'price',
+            'payment_details', 'status'
+        ]
+
+    def validate_status(self, value):
+        if value not in [
+            Cargo.CargoStatus.MANAGER_APPROVED,
+            Cargo.CargoStatus.REJECTED,
+            Cargo.CargoStatus.PENDING
+        ]:
+            raise serializers.ValidationError(
+                "Invalid status for manager update"
+            )
+        return value
+
+    def validate(self, data):
+        user = self.context['request'].user
+        if user.role != 'manager':
+            raise serializers.ValidationError(
+                "Only managers can update cargo details"
+            )
+        return data
+    
+class ExternalCargoCreateSerializer(serializers.ModelSerializer):
+    """Serializer for external cargo creation with API key validation"""
+    api_key = serializers.CharField(write_only=True)
+    source_type = serializers.ChoiceField(choices=Cargo.SourceType.choices)
+    source_id = serializers.CharField(required=True)
+
+    class Meta:
+        model = Cargo
+        fields = [
+            'title', 'description', 'weight',
+            'volume', 'length', 'width', 'height',
+            'loading_point', 'unloading_point',
+            'additional_points', 'loading_date',
+            'is_constant', 'is_ready', 'vehicle_type',
+            'loading_type', 'payment_method', 'price',
+            'payment_details', 'source_type', 'source_id',
+            'api_key'
+        ]
+
+    def validate_api_key(self, value):
+        """Validate the API key against the configured value"""
+        valid_key = getattr(settings, 'EXTERNAL_API_KEY', None)
+        if not valid_key:
+            raise serializers.ValidationError(
+                "API key validation is not configured"
+            )
+        
+        if value != valid_key:
+            raise serializers.ValidationError("Invalid API key")
+        
+        return value
+
+    def validate(self, data):
+        """Additional validation for the complete cargo data"""
+        # Remove api_key from data before saving
+        data.pop('api_key', None)
+        
+        # Set status to pending for external cargos
+        data['status'] = 'pending'
+        
+        return data
+    
 class CargoDocumentSerializer(serializers.ModelSerializer):
     class Meta:
         model = CargoDocument
@@ -734,7 +1048,7 @@ class CargoSerializer(serializers.ModelSerializer):
     assigned_to = UserProfileSerializer(read_only=True)
     managed_by = UserProfileSerializer(read_only=True)
     carrier_requests = CarrierRequestListSerializer(many=True, read_only=True)
-    
+
     class Meta:
         model = Cargo
         fields = [
@@ -793,26 +1107,49 @@ class CargoCreateSerializer(serializers.ModelSerializer):
     #         **validated_data
     #     )
 
-    def create(self, validated_data):
-        """Create cargo with default status based on user role"""
-        user = self.context['request'].user
+    # def create(self, validated_data):
+    #     """Create cargo with default status based on user role"""
+    #     user = self.context['request'].user
         
+    #     # Set initial status based on user role
+    #     if user.role == 'cargo-owner':
+    #         status = 'draft'  # Needs manager approval
+    #     elif user.role == 'logistics-company':
+    #         status = 'pending'  # Goes directly to students
+    #     else:
+    #         status = 'draft'  # Default status
+            
+    #     print(validated_data)
+    #     print(user)
+    #     validated_data.pop('owner', None)
+    #     return Cargo.objects.create(
+    #         owner=user,
+    #         status=status,
+    #         **validated_data
+    #     )
+    def create(self, validated_data):
+        """Create cargo with appropriate initial status based on user role"""
+        request = self.context.get('request')
+        user = request.user if request else None
+
+        if not user:
+            raise serializers.ValidationError("User is required")
+
         # Set initial status based on user role
         if user.role == 'cargo-owner':
-            status = 'draft'  # Needs manager approval
+            # Cargo owners' submissions need manager approval
+            validated_data['status'] = Cargo.CargoStatus.PENDING_APPROVAL
         elif user.role == 'logistics-company':
-            status = 'pending'  # Goes directly to students
+            # Logistics companies' submissions go directly to pending
+            validated_data['status'] = Cargo.CargoStatus.PENDING
+        elif user.role == 'manager':
+            # Managers' submissions are automatically approved
+            validated_data['status'] = Cargo.CargoStatus.MANAGER_APPROVED
+            validated_data['approved_by'] = user
         else:
-            status = 'draft'  # Default status
-            
-        print(validated_data)
-        print(user)
-        validated_data.pop('owner', None)
-        return Cargo.objects.create(
-            owner=user,
-            status=status,
-            **validated_data
-        )
+            validated_data['status'] = Cargo.CargoStatus.DRAFT
+
+        return super().create(validated_data)
     
 class CargoUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating cargo"""
@@ -1037,13 +1374,94 @@ class CargoAcceptanceSerializer(serializers.ModelSerializer):
 
 ```
 
-# cargo\tests.py
+# cargo\signals.py
 
 ```py
-from django.test import TestCase
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+from django.contrib.auth import get_user_model
+from .models import Cargo, CarrierRequest
+from core.services.telegram import telegram_service
+import asyncio
 
-# Create your tests here.
+User = get_user_model()
 
+@receiver(post_save, sender=Cargo)
+def notify_cargo_status_change(sender, instance, created, **kwargs):
+    """Send notifications for cargo status changes"""
+    if created:
+        return
+        
+    if instance.tracker.has_changed('status'):
+        old_status = instance.tracker.previous('status')
+        new_status = instance.status
+        
+        # Determine who should be notified
+        recipients = []
+        action = ""
+        
+        if new_status == 'pending_approval':
+            # Notify managers
+            recipients = User.objects.filter(
+                role='manager',
+                is_active=True,
+                telegram_id__isnull=False
+            )
+            action = f"Новый груз требует проверки: {instance.title}"
+            
+        elif new_status == 'manager_approved':
+            # Notify students
+            recipients = User.objects.filter(
+                role='student',
+                is_active=True,
+                telegram_id__isnull=False
+            )
+            action = f"Новый груз доступен: {instance.title}"
+            
+        elif new_status == 'assigned':
+            # Notify carrier
+            if instance.assigned_to and instance.assigned_to.telegram_id:
+                recipients = [instance.assigned_to]
+                action = f"Вам назначен груз: {instance.title}"
+
+        # Send notifications via Telegram
+        if recipients and action:
+            messages = [
+                (user.telegram_id, telegram_service.format_cargo_notification(instance, action))
+                for user in recipients
+            ]
+            asyncio.create_task(telegram_service.send_bulk_messages(messages))
+
+@receiver(post_save, sender=CarrierRequest)
+def notify_carrier_request_status_change(sender, instance, created, **kwargs):
+    """Send notifications for carrier request status changes"""
+    if created:
+        return
+        
+    if instance.tracker.has_changed('status'):
+        old_status = instance.tracker.previous('status')
+        new_status = instance.status
+        
+        recipients = []
+        action = ""
+        
+        if new_status == 'assigned':
+            if instance.carrier and instance.carrier.telegram_id:
+                recipients = [instance.carrier]
+                action = "Вашей заявке назначен груз"
+                
+        elif new_status in ['accepted', 'rejected']:
+            if instance.assigned_by and instance.assigned_by.telegram_id:
+                recipients = [instance.assigned_by]
+                action = f"Перевозчик {'принял' if new_status == 'accepted' else 'отклонил'} назначенный груз"
+
+        # Send notifications via Telegram
+        if recipients and action:
+            messages = [
+                (user.telegram_id, telegram_service.format_carrier_notification(instance, action))
+                for user in recipients
+            ]
+            asyncio.create_task(telegram_service.send_bulk_messages(messages))
 ```
 
 # cargo\urls.py
@@ -1054,11 +1472,12 @@ from rest_framework.routers import DefaultRouter
 from rest_framework_nested import routers
 from .views import (
     CargoViewSet,
-    CarrierRequestViewSet
+    CarrierRequestViewSet,ExternalCargoViewSet
 )
 
 router = DefaultRouter()
 router.register(r'cargos', CargoViewSet, basename='cargo')
+router.register(r'external', ExternalCargoViewSet, basename='external-cargo')
 router.register(r'carrier-requests', CarrierRequestViewSet, basename='carrier-request')
 
 urlpatterns = [
@@ -1089,17 +1508,162 @@ from .serializers import (
     CarrierRequestSerializer,
     CarrierRequestListSerializer,
     CarrierRequestCreateSerializer,
-    CarrierRequestUpdateSerializer
+    CarrierRequestUpdateSerializer,
+    ManagerCargoUpdateSerializer,
+    ExternalCargoCreateSerializer
 )
 from .filters import CargoFilter
 from core.permissions import (
     IsVerifiedUser,
+    IsManager,
     IsObjectOwner,
+    isStudent,
     IsCarrier,
     IsLogisticsCompany,
     IsCargoOwner
 )
 
+class ManagerCargoViewSet(viewsets.ModelViewSet):
+    """ViewSet for manager operations on cargo"""
+    permission_classes = [permissions.IsAuthenticated, IsManager]
+    serializer_class = ManagerCargoUpdateSerializer
+
+    def get_queryset(self):
+        """Filter queryset to show relevant cargos for managers"""
+        return Cargo.objects.filter(
+            Q(status=Cargo.CargoStatus.PENDING_APPROVAL) |
+            Q(approved_by=self.request.user) |
+            Q(status=Cargo.CargoStatus.MANAGER_APPROVED)
+        ).order_by('-created_at')
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        """Approve a cargo"""
+        cargo = self.get_object()
+        serializer = CargoApprovalSerializer(
+            data=request.data,
+            context={'request': request}
+        )
+        
+        if serializer.is_valid():
+            try:
+                cargo.approve(
+                    manager=request.user,
+                    notes=serializer.validated_data.get('approval_notes')
+                )
+                return Response(
+                    {'status': 'Cargo approved successfully'},
+                    status=status.HTTP_200_OK
+                )
+            except ValueError as e:
+                return Response(
+                    {'error': str(e)},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """Reject a cargo"""
+        cargo = self.get_object()
+        serializer = CargoApprovalSerializer(
+            data=request.data,
+            context={'request': request}
+        )
+        
+        if serializer.is_valid():
+            try:
+                cargo.reject(
+                    manager=request.user,
+                    notes=serializer.validated_data.get('approval_notes')
+                )
+                return Response(
+                    {'status': 'Cargo rejected successfully'},
+                    status=status.HTTP_200_OK
+                )
+            except ValueError as e:
+                return Response(
+                    {'error': str(e)},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    @action(detail=False, methods=['get'])
+    def pending_approval(self, request):
+        """Get cargos pending manager approval"""
+        queryset = self.get_queryset().filter(
+            status=Cargo.CargoStatus.PENDING_APPROVAL
+        )
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def approved(self, request):
+        """Get cargos approved by the current manager"""
+        queryset = self.get_queryset().filter(
+            status=Cargo.CargoStatus.MANAGER_APPROVED,
+            approved_by=request.user
+        )
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+    
+class ExternalCargoViewSet(viewsets.GenericViewSet):
+    """ViewSet for external cargo creation"""
+    permission_classes = [permissions.AllowAny]
+    serializer_class = ExternalCargoCreateSerializer
+
+    @action(detail=False, methods=['post'])
+    def create_external(self, request):
+        """
+        Create a cargo from external source (Telegram/API)
+        Requires valid API key for authentication
+        """
+        serializer = self.get_serializer(data=request.data)
+        
+        try:
+            serializer.is_valid(raise_exception=True)
+            
+            # Get or create system user for external cargos
+            system_user, _ = User.objects.get_or_create(
+                username='system',
+                defaults={
+                    'first_name': 'System',
+                    'is_active': True,
+                    'is_verified': True,
+                    'role': 'logistics-company'
+                }
+            )
+            
+            # Create cargo with system user as owner
+            cargo = Cargo.objects.create(
+                owner=system_user,
+                **serializer.validated_data
+            )
+            
+            return Response(
+                {
+                    'id': cargo.id,
+                    'status': 'success',
+                    'message': 'Cargo created successfully'
+                },
+                status=status.HTTP_201_CREATED
+            )
+            
+        except Exception as e:
+            return Response(
+                {
+                    'status': 'error',
+                    'message': str(e)
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
 class CarrierRequestViewSet(viewsets.ModelViewSet):
     """ViewSet for carrier requests"""
     queryset = CarrierRequest.objects.all()
@@ -1194,22 +1758,46 @@ class CargoViewSet(viewsets.ModelViewSet):
         user = self.request.user
 
         if user.role == 'carrier':
-            # Carriers see pending cargos and ones assigned to them
+            # Carriers see pending and assigned cargos
             return queryset.filter(
-                Q(status='pending') |
+                Q(status=Cargo.CargoStatus.PENDING) |
                 Q(assigned_to=user)
             )
         elif user.role == 'student':
-            # Students see pending cargos and ones they manage
-            return queryset.filter(
+            # Students see manager-approved cargos
+            # VIP students see all approved cargos, standard students see limited ones
+            base_query = Q(status=Cargo.CargoStatus.MANAGER_APPROVED)
+            if user.tariff == 'standard':
+                 return queryset.filter(
                 Q(status='pending') |
-                Q(managed_by=user)
+                Q(managed_by=user) | 
+                Q(owner=user)
             )
-        elif user.role in ['cargo-owner', 'logistics-company']:
+            if user.tariff == 'vip':
+                return queryset.filter(
+                Q(status='pending') |
+                Q(managed_by=user) | 
+                Q(owner=user) | 
+                Q(status=Cargo.CargoStatus.MANAGER_APPROVED)
+            )
+                # return queryset.filter(base_query)
+            
+            else:
+                return queryset.none()
+
+        elif user.role == 'cargo-owner':
             # Owners see their own cargos
             return queryset.filter(owner=user)
+        elif user.role == 'logistics-company':
+            # Companies see their own cargos
+            return queryset.filter(owner=user)
+        elif user.role == 'manager':
+            # Managers see all cargos
+            return queryset
         elif user.is_staff:
             return queryset
+            
+        return queryset.none()
             
         return queryset.none()
     
@@ -1232,7 +1820,7 @@ class CargoViewSet(viewsets.ModelViewSet):
         if self.action == 'create':
             permission_classes = [
                 IsVerifiedUser,
-                (IsCargoOwner | IsLogisticsCompany)
+                (IsCargoOwner | IsLogisticsCompany | isStudent)
             ]
         elif self.action in ['update', 'partial_update', 'destroy']:
             permission_classes = [IsVerifiedUser, IsObjectOwner]
@@ -1301,22 +1889,44 @@ class CargoViewSet(viewsets.ModelViewSet):
         )
 
     def perform_create(self, serializer):
-        """Create a new cargo and notify relevant users"""
+        """Create cargo and handle notifications"""
         cargo = serializer.save(owner=self.request.user)
+
+        # Create notifications based on cargo status
+        if cargo.status == Cargo.CargoStatus.PENDING_APPROVAL:
+            self.notify_managers(cargo)
+        elif cargo.status == Cargo.CargoStatus.MANAGER_APPROVED:
+            self.notify_students(cargo)
+
+    def notify_managers(self, cargo):
+        """Notify managers about new cargo requiring approval"""
+        from core.models import Notification
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
         
-        # Create notification for logistics students if cargo needs assignment
-        if cargo.status == 'pending':
-            from core.models import Notification
-            # Get all logistics students
-            students = User.objects.filter(role='student', is_active=True)
-            
-            for student in students:
-                Notification.objects.create(
-                    user=student,
-                    type='cargo',
-                    message=f'New cargo available: {cargo.title} ({cargo.loading_point} - {cargo.unloading_point})',
-                    content_object=cargo
-                )
+        managers = User.objects.filter(role='manager', is_active=True)
+        for manager in managers:
+            Notification.objects.create(
+                user=manager,
+                type='cargo',
+                message=f'New cargo requires approval: {cargo.title}',
+                content_object=cargo
+            )
+
+    def notify_students(self, cargo):
+        """Notify students about new approved cargo"""
+        from core.models import Notification
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        
+        students = User.objects.filter(role='student', is_active=True)
+        for student in students:
+            Notification.objects.create(
+                user=student,
+                type='cargo',
+                message=f'New cargo available: {cargo.title}',
+                content_object=cargo
+            )
 
     def perform_update(self, serializer):
         """Update cargo and handle notifications"""
@@ -1772,6 +2382,26 @@ class SearchFilter(models.Model):
 ```py
 from rest_framework import permissions
 
+
+class IsManager(permissions.BasePermission):
+    """
+    Allow access only to manager users.
+    """
+    def has_permission(self, request, view):
+        return bool(
+            request.user and
+            request.user.is_authenticated and
+            request.user.role == 'manager'
+        )
+    
+    def has_object_permission(self, request, view, obj):
+        # Managers can modify any cargo objects
+        return bool(
+            request.user and
+            request.user.is_authenticated and
+            request.user.role == 'manager'
+        )
+    
 class IsVerifiedUser(permissions.BasePermission):
     """
     Allow access only to verified users.
@@ -1781,6 +2411,17 @@ class IsVerifiedUser(permissions.BasePermission):
             request.user and
             request.user.is_authenticated and
             request.user.is_verified
+        )
+    
+class isStudent(permissions.BasePermission):
+    """
+    Allow access only to students.
+    """
+    def has_permission(self, request, view):
+        return bool(
+            request.user and
+            request.user.is_authenticated and
+            request.user.role == 'student'
         )
 
 class IsCarrier(permissions.BasePermission):
@@ -1962,6 +2603,237 @@ class SearchFilterUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = SearchFilter
         fields = ['name', 'filter_data', 'notifications_enabled']
+```
+
+# core\services\telegram.py
+
+```py
+import logging
+from typing import List, Optional
+from telegram.ext import Application
+from telegram import Bot
+from django.conf import settings
+from django.core.cache import cache
+from concurrent.futures import ThreadPoolExecutor
+import telegram.error
+from users.models import User
+from cargo.models import Cargo, CarrierRequest
+
+logger = logging.getLogger(__name__)
+
+class TelegramNotificationService:
+    def __init__(self):
+        self.token = settings.TELEGRAM_BOT_TOKEN
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        
+    def _send_message_sync(
+        self,
+        chat_id: str,
+        message: str,
+        silent: bool = False
+    ) -> bool:
+        """Send message synchronously using python-telegram-bot"""
+        try:
+            bot = Bot(token=self.token)
+            bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode='HTML',
+                disable_notification=silent
+            )
+            return True
+        except telegram.error.TelegramError as e:
+            logger.error(f"Failed to send Telegram message to {chat_id}: {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error sending message to {chat_id}: {str(e)}")
+            return False
+
+    def send_message(
+        self,
+        chat_id: str,
+        message: str,
+        silent: bool = False
+    ) -> bool:
+        """Send message using thread pool"""
+        try:
+            future = self.executor.submit(
+                self._send_message_sync,
+                chat_id,
+                message,
+                silent
+            )
+            return future.result(timeout=10)  # 10 second timeout
+        except Exception as e:
+            logger.error(f"Error in send_message thread: {str(e)}")
+            return False
+
+    def send_bulk_messages(
+        self,
+        messages: List[tuple[str, str]],
+        rate_limit: int = 30
+    ) -> None:
+        """Send multiple messages with rate limiting"""
+        from time import sleep
+        
+        for chat_id, message in messages:
+            # Rate limit: max 30 messages per second
+            if not cache.add(f'telegram_ratelimit_{chat_id}', 1, timeout=1):
+                sleep(1 / rate_limit)
+                
+            self.send_message(chat_id, message)
+
+    def format_cargo_notification(self, cargo: 'Cargo', action: str) -> str:
+        """Format cargo notification message"""
+        return f"""
+🚛 <b>Уведомление о грузе</b>
+
+{action}
+
+<b>Груз:</b> {cargo.title}
+<b>Маршрут:</b> {cargo.loading_point} ➡️ {cargo.unloading_point}
+<b>Вес:</b> {cargo.weight} т
+{f'<b>Объем:</b> {cargo.volume} м³' if cargo.volume else ''}
+<b>Тип транспорта:</b> {cargo.get_vehicle_type_display()}
+<b>Оплата:</b> {cargo.get_payment_method_display()}
+{f'<b>Цена:</b> {cargo.price} ₽' if cargo.price else ''}
+
+👉 Перейдите в приложение для подробностей
+"""
+
+    def format_carrier_notification(
+        self,
+        carrier_request: 'CarrierRequest',
+        action: str
+    ) -> str:
+        """Format carrier request notification message"""
+        return f"""
+🚚 <b>Уведомление о заявке перевозчика</b>
+
+{action}
+
+<b>Перевозчик:</b> {carrier_request.carrier.get_full_name()}
+<b>Транспорт:</b> {carrier_request.vehicle.registration_number}
+<b>Маршрут:</b> {carrier_request.loading_point} ➡️ {carrier_request.unloading_point}
+<b>Дата готовности:</b> {carrier_request.ready_date.strftime('%d.%m.%Y')}
+
+👉 Перейдите в приложение для подробностей
+"""
+
+    def format_verification_notification(
+        self,
+        user: 'User',
+        action: str
+    ) -> str:
+        """Format verification notification message"""
+        return f"""
+✅ <b>Уведомление о верификации</b>
+
+{action}
+
+<b>Пользователь:</b> {user.get_full_name()}
+<b>Статус:</b> {'Верифицирован' if user.is_verified else 'Ожидает проверки'}
+
+👉 Перейдите в приложение для подробностей
+"""
+
+telegram_service = TelegramNotificationService()
+```
+
+# core\signals.py
+
+```py
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+from django.conf import settings
+
+from users.models import User
+from .models import Notification
+from cargo.models import Cargo, CarrierRequest
+from .services.telegram import TelegramNotificationService
+import asyncio
+
+import logging
+telegram_service = TelegramNotificationService()
+
+
+logger = logging.getLogger(__name__)
+
+@receiver(post_save, sender=Notification)
+def send_telegram_notification(sender, instance, created, **kwargs):
+    """Send notification to Telegram when new notification is created"""
+    if not created:
+        return
+        
+    try:
+        # Get the related content object (Cargo or CarrierRequest)
+        content_object = instance.content_object
+        
+        # Skip if no content object
+        if not content_object:
+            return
+            
+        # Format message based on content type
+        if isinstance(content_object, Cargo):
+            message = telegram_service.format_cargo_notification(
+                content_object,
+                instance.message
+            )
+        elif isinstance(content_object, CarrierRequest):
+            message = telegram_service.format_carrier_notification(
+                content_object,
+                instance.message
+            )
+        else:
+            message = instance.message
+            
+        # Get user's telegram ID
+        telegram_id = instance.user.telegram_id
+        
+        # Send message asynchronously
+        asyncio.create_task(
+            telegram_service.send_message(telegram_id, message)
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to send Telegram notification: {str(e)}")
+
+@receiver(post_save, sender=Cargo)
+def notify_cargo_status_change(sender, instance, created, **kwargs):
+    """Create notifications for cargo status changes"""
+    if created:
+        return
+        
+    if instance.tracker.has_changed('status'):
+        old_status = instance.tracker.previous('status')
+        new_status = instance.status
+        
+        # Determine who should be notified
+        recipients = []
+        
+        if new_status == 'pending_approval':
+            # Notify managers
+            recipients = User.objects.filter(role='manager', is_active=True)
+            message = f"Новый груз требует проверки: {instance.title}"
+            
+        elif new_status == 'manager_approved':
+            # Notify students
+            recipients = User.objects.filter(role='student', is_active=True)
+            message = f"Новый груз доступен: {instance.title}"
+            
+        elif new_status == 'assigned':
+            # Notify carrier
+            recipients = [instance.assigned_to]
+            message = f"Вам назначен груз: {instance.title}"
+            
+        # Create notifications
+        for recipient in recipients:
+            Notification.objects.create(
+                user=recipient,
+                type='cargo',
+                message=message,
+                content_object=instance
+            )
 ```
 
 # core\tasks.py
@@ -2160,15 +3032,6 @@ def cargo_matches_filter(cargo, filter_data):
     return False
 ```
 
-# core\tests.py
-
-```py
-from django.test import TestCase
-
-# Create your tests here.
-
-```
-
 # core\urls.py
 
 ```py
@@ -2199,7 +3062,7 @@ urlpatterns = [
 # core\views.py
 
 ```py
-from rest_framework import viewsets, status, permissions
+from rest_framework import viewsets, status, permissions,filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db.models import Q
@@ -2216,7 +3079,7 @@ from .serializers import (
     SearchFilterUpdateSerializer
 )
 from .permissions import IsVerifiedUser, IsStaffOrReadOnly
-
+ 
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -2657,6 +3520,7 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'your-secret-key-for-development')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DJANGO_DEBUG', 'True') == 'True'
+EXTERNAL_API_KEY = os.getenv('EXTERNAL_API_KEY', 'test')
 
 ALLOWED_HOSTS = ['*']
 # os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,https://f623-84-54-80-95.ngrok-free.app,http://localhost:3000,').split(',')
@@ -2822,6 +3686,7 @@ CORS_ALLOWED_ORIGINS = [
     # '*',  # Allow all origins
     'http://localhost:3000',
     'http://127.0.0.1:3000',
+    'https://d0af-94-230-229-138.ngrok-free.app',
     'https://f623-84-54-80-95.ngrok-free.app',      
 
 ]
@@ -2982,22 +3847,10 @@ if __name__ == '__main__':
 
 ```
 
-# media\user_documents\wavy-black-white-background.jpg
-
-This is a binary file of the type: Image
-
-# media\vehicle_documents\wavy-black-white-background_uKSy2Xa.jpg
-
-This is a binary file of the type: Image
-
-# media\vehicle_documents\wavy-black-white-background.jpg
-
-This is a binary file of the type: Image
-
 # README.md
 
 ```md
-# Logit Backend API ## Overview Logit Backend API - это RESTful API для платформы логистики, интегрированной с Telegram. API обеспечивает функциональность для управления грузами, транспортными средствами и другими аспектами логистического процесса. ## Основные функции - Аутентификация через Telegram WebApp - Управление пользователями и ролями - Управление грузами и заявками - Управление транспортными средствами - Система уведомлений и избранного - Рейтинги и отзывы ## Технологии - Python 3.10+ - Django 5.0 - Django REST Framework - PostgreSQL - Redis & Celery - JWT аутентификация - Telegram Bot API ## Установка 1. Клонируйте репозиторий: \`\`\`bash git clone https://github.com/yourusername/logit-backend.git cd logit-backend \`\`\` 2. Создайте виртуальное окружение: \`\`\`bash python -m venv venv source venv/bin/activate # Linux/Mac venv\Scripts\activate # Windows \`\`\` 3. Установите зависимости: \`\`\`bash pip install -r requirements.txt \`\`\` 4. Создайте файл .env и настройте переменные окружения: \`\`\`env DJANGO_SECRET_KEY=your-secret-key DJANGO_DEBUG=True DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1 TELEGRAM_BOT_TOKEN=your-bot-token POSTGRES_DB=logit_db POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_HOST=localhost POSTGRES_PORT=5432 \`\`\` 5. Примените миграции: \`\`\`bash python manage.py migrate \`\`\` 6. Создайте суперпользователя: \`\`\`bash python manage.py createsuperuser \`\`\` 7. Запустите сервер: \`\`\`bash python manage.py runserver \`\`\` ## API Endpoints ### Аутентификация #### Telegram Auth \`\`\`http POST /api/auth/telegram-auth/ \`\`\` Аутентификация через Telegram WebApp данные. **Request:** \`\`\`json { "hash": "telegram_hash", "user": {"id": 123456789, "first_name": "John"}, "auth_date": 1677649421 } \`\`\` **Response:** \`\`\`json { "access": "jwt_access_token", "refresh": "jwt_refresh_token", "user": { "telegram_id": "123456789", "username": "john_doe", "role": "carrier" } } \`\`\` #### Обновление токена \`\`\`http POST /api/auth/token/refresh/ \`\`\` ### Пользователи #### Получение профиля \`\`\`http GET /api/users/me/ \`\`\` #### Обновление профиля \`\`\`http PUT /api/users/update-profile/ \`\`\` ### Грузы #### Список грузов \`\`\`http GET /api/cargo/ \`\`\` #### Создание груза \`\`\`http POST /api/cargo/ \`\`\` #### Поиск грузов \`\`\`http POST /api/cargo/search/ \`\`\` ### Транспортные средства #### Список транспорта \`\`\`http GET /api/vehicles/ \`\`\` #### Создание транспорта \`\`\`http POST /api/vehicles/ \`\`\` #### Верификация транспорта \`\`\`http POST /api/vehicles/{id}/verify/ \`\`\` ## Роли пользователей 1. **Перевозчик (carrier)** - Управление транспортными средствами - Поиск грузов - Отслеживание заявок 2. **Грузовладелец (cargo-owner)** - Создание заявок на перевозку - Управление грузами - Поиск перевозчиков 3. **Логистическая компания (logistics-company)** - Управление заявками - Работа с перевозчиками и грузовладельцами 4. **Студент (student)** - Ограниченный доступ к функционалу - Обучение работе с системой ## Документация API Полная документация API доступна через Swagger UI по адресу `/api/docs/` после запуска сервера. Также доступна альтернативная версия документации через ReDoc: `/api/redoc/` ## Разработка ### Запуск тестов \`\`\`bash python manage.py test \`\`\` ### Запуск линтера \`\`\`bash flake8 . black . \`\`\` ### Запуск Celery \`\`\`bash celery -A logit_backend worker -l info celery -A logit_backend beat -l info \`\`\` ## Безопасность - Все запросы должны быть аутентифицированы через JWT токены - Используйте HTTPS в продакшене - Следите за сроками действия токенов - Проверяйте роли и разрешения ## Деплой 1. Настройте Production переменные окружения 2. Соберите статические файлы 3. Настройте Gunicorn и Nginx 4. Настройте SSL сертификат 5. Настройте базу данных 6. Настройте Redis 7. Запустите Celery workers ## Лицензия [MIT License](LICENSE) ## Контакты По всем вопросам обращайтесь: support@logit.com
+# Logit Platform - Logistics Management System ![Logit Platform](logit\app\blue.png) ## Overview Logit Platform is a comprehensive logistics management system designed to streamline cargo transportation and logistics operations. The platform connects cargo owners, carriers, logistics companies, and logistics students in a unified ecosystem. ## 🌟 Key Features ### Authentication & User Management - Telegram WebApp authentication integration - Multi-role user system (Carriers, Cargo Owners, Logistics Companies, Students) - Profile management with document verification - Role-based access control - Language selection (Russian/Uzbek) ### Cargo Management - Create and manage cargo listings - Advanced cargo search with filtering - Real-time cargo status tracking - Multi-point route support - Automatic cargo matching with carriers - Price negotiation system - Document management for cargo ### Vehicle Management - Detailed vehicle registration and management - Vehicle document verification - Technical specifications tracking - Vehicle availability management - ADR/TIR/DOZVOL certification support - Vehicle inspection history ### Carrier Features - Vehicle fleet management - Cargo acceptance/rejection system - Real-time cargo notifications - Document upload and verification - Route planning and tracking - Availability management ### Student Features - Access to logistics training - Supervised cargo management - Learning progression tracking - Practice with real cargo listings - Mentor assignment system ### Platform Features - Real-time notifications - Favorites system - Rating and review system - Distance calculation - Advanced search filters - Document verification system - Multi-language support - Telegram group integration ## 🔧 Technology Stack ### Frontend - Next.js 14 (App Router) - TypeScript - TailwindCSS - Shadcn/ui Components - Telegram WebApp SDK - React Query - Axios - Framer Motion ### Backend - Django - Django REST Framework - PostgreSQL - Redis - Celery - JWT Authentication - Swagger/OpenAPI ## 📦 Installation ### Prerequisites - Node.js 18+ - Python 3.10+ - PostgreSQL - Redis - Telegram Bot Token ### Frontend Setup 1. Clone the repository: \`\`\`bash git clone https://github.com/your-username/logit-platform.git cd logit-platform/frontend \`\`\` 2. Install dependencies: \`\`\`bash npm install \`\`\` 3. Create .env.local: \`\`\`env NEXT_PUBLIC_API_URL=http://localhost:8000/api NEXT_PUBLIC_TELEGRAM_BOT_TOKEN=your_telegram_bot_token \`\`\` 4. Run development server: \`\`\`bash npm run dev \`\`\` ### Backend Setup 1. Navigate to backend directory: \`\`\`bash cd backend \`\`\` 2. Create virtual environment: \`\`\`bash python -m venv venv source venv/bin/activate # Linux/Mac venv\Scripts\activate # Windows \`\`\` 3. Install dependencies: \`\`\`bash pip install -r requirements.txt \`\`\` 4. Create .env: \`\`\`env DJANGO_SECRET_KEY=your_secret_key DJANGO_DEBUG=True TELEGRAM_BOT_TOKEN=your_telegram_bot_token POSTGRES_DB=logit_db POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_HOST=localhost POSTGRES_PORT=5432 \`\`\` 5. Run migrations: \`\`\`bash python manage.py migrate \`\`\` 6. Start development server: \`\`\`bash python manage.py runserver \`\`\` ## 🏗 Project Structure ### Frontend Structure \`\`\` ├── app/ # Next.js app directory │ ├── (auth)/ # Authentication pages │ ├── cargo/ # Cargo management pages │ ├── vehicles/ # Vehicle management pages │ ├── components/ # Shared components │ ├── contexts/ # React contexts │ ├── hooks/ # Custom hooks │ └── lib/ # Utilities and API ├── public/ # Static files └── components/ # UI components \`\`\` ### Backend Structure \`\`\` ├── cargo/ # Cargo management ├── vehicles/ # Vehicle management ├── users/ # User management ├── core/ # Core functionality └── logit_backend/ # Project settings \`\`\` ## 🚀 Features In Detail ### User Registration Flow 1. User opens Telegram bot 2. Selects language preference 3. Chooses user type (Individual/Legal Entity) 4. Selects role (Carrier/Cargo Owner/etc.) 5. Fills profile information 6. Uploads required documents 7. Awaits verification (if required) ### Cargo Management Flow 1. Cargo owner creates cargo listing 2. System processes and validates cargo information 3. Students can view and manage cargo listings 4. Students can match cargo with carriers 5. Carriers receive notification and can accept/reject 6. System tracks cargo status throughout delivery ### Vehicle Management Flow 1. Carrier registers vehicles 2. Uploads required documentation 3. System verifies vehicle information 4. Carrier can update vehicle availability 5. System matches vehicles with compatible cargo 6. Tracks vehicle status and documents expiry ### Student Learning Flow 1. Student registers with group information 2. Gets assigned to mentor 3. Can view and practice with real cargo listings 4. Manages cargo-carrier matching 5. Receives feedback from mentors 6. Tracks learning progress ## 🔐 Security - JWT-based authentication - Role-based access control - Document verification system - Secure file uploads - HTTPS encryption - Input validation - Rate limiting - Session management ## 📱 Mobile Responsiveness The platform is fully responsive and optimized for: - Desktop browsers - Mobile devices - Telegram WebApp - Tablets ## 🌐 API Documentation API documentation is available at: - Swagger UI: `/api/docs/` - ReDoc: `/api/redoc/` ## 🤝 Contributing Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests. ## 📄 License This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details ## 👥 Team - Product Owner: [Name] - Lead Developer: [Name] - Backend Developer: [Name] - Frontend Developer: [Name] - UI/UX Designer: [Name] ## 📞 Support For support, please contact: - Email: support@logit.com - Telegram: @logit_support - Website: https://logit.com/support ## 🌟 Acknowledgments - Telegram for WebApp SDK - Shadcn for UI components - All contributors and testers ## 🗺 Roadmap ### Phase 1 (Current) - Core platform functionality - Basic cargo management - Vehicle registration - User authentication ### Phase 2 (Planned) - Advanced analytics - Mobile applications - Real-time tracking - Payment integration - AI-powered matching ### Phase 3 (Future) - International expansion - Blockchain integration - IoT device support - Advanced automation ## ⚙ Configuration ### Environment Variables #### Frontend \`\`\`env NEXT_PUBLIC_API_URL= NEXT_PUBLIC_TELEGRAM_BOT_TOKEN= \`\`\` #### Backend \`\`\`env DJANGO_SECRET_KEY= DJANGO_DEBUG= TELEGRAM_BOT_TOKEN= POSTGRES_DB= POSTGRES_USER= POSTGRES_PASSWORD= POSTGRES_HOST= POSTGRES_PORT= \`\`\` ## 🚀 Deployment ### Frontend Deployment 1. Build the application: \`\`\`bash npm run build \`\`\` 2. Start production server: \`\`\`bash npm start \`\`\` ### Backend Deployment 1. Collect static files: \`\`\`bash python manage.py collectstatic \`\`\` 2. Configure Gunicorn: \`\`\`bash gunicorn logit_backend.wsgi:application \`\`\` 3. Set up Nginx as reverse proxy ## 📊 Monitoring - Application logs - Error tracking - Performance monitoring - User analytics - System health checks ## 🔄 Backup & Recovery - Database backups - File system backups - Recovery procedures - Data retention policies ## 🏆 Best Practices - Clean code principles - Component reusability - Type safety - Error handling - Performance optimization - Security measures - Documentation - Testing ## 🎯 Goals 1. Streamline logistics operations 2. Connect industry participants 3. Provide practical training 4. Ensure safety and compliance 5. Foster industry growth --- **Note**: This project is actively maintained and regularly updated. For the latest features and changes, please check the CHANGELOG.md file.
 ```
 
 # users\admin.py
@@ -3014,11 +3867,11 @@ from django.utils.html import format_html
 class CustomUserAdmin(UserAdmin):
     list_display = (
         'telegram_id', 'get_full_name', 'username', 'role',
-        'type', 'rating', 'is_active', 'is_verified'
+        'type', 'rating', 'is_active', 'is_verified', 'tariff'
     )
     list_filter = (
         'is_active', 'is_verified', 'role', 'type',
-        'date_joined', 'last_login'
+        'date_joined', 'last_login', 'tariff'
     )
     search_fields = (
         'telegram_id', 'first_name', 'last_name',
@@ -3030,13 +3883,13 @@ class CustomUserAdmin(UserAdmin):
         (None, {
             'fields': (
                 'telegram_id', 'first_name', 'last_name',
-                'username', 'language_code'
+                'username', 'language_code', 
             )
         }),
         (_('Profile'), {
             'fields': (
                 'type', 'role', 'preferred_language',
-                'phone_number', 'whatsapp_number'
+                'phone_number', 'whatsapp_number',
             )
         }),
         (_('Company Info'), {
@@ -3047,7 +3900,7 @@ class CustomUserAdmin(UserAdmin):
         (_('Student Info'), {
             'fields': (
                 'student_id', 'group_name', 'study_language',
-                'curator_name', 'end_date'
+                'curator_name', 'end_date',  'tariff'
             )
         }),
         (_('Status'), {
@@ -3340,18 +4193,18 @@ class User(AbstractBaseUser, PermissionsMixin):
         LOGISTICS_COMPANY = 'logistics-company', _('Logistics Company')
         TRANSPORT_COMPANY = 'transport-company', _('Transport Company')
         LOGIT_TRANS = 'logit-trans', _('Logit Trans')
+        MANAGER = 'manager', _('Manager')
 
     class Language(models.TextChoices):
         RUSSIAN = 'ru', _('Russian')
         UZBEK = 'uz', _('Uzbek')
 
-    # Telegram Integration Fields
-    telegram_id = models.CharField(
-        _('Telegram ID'),
-        max_length=100,
-        unique=True,
-        primary_key=True
-    )
+    class StudentTariff(models.TextChoices):
+        STANDARD = 'standard', _('Standard Pro')
+        VIP = 'vip', _('VIP Pro')
+
+    # Basic User Fields
+    telegram_id = models.CharField(_('Telegram ID'), max_length=100, unique=True, primary_key=True)
     first_name = models.CharField(_('First Name'), max_length=255)
     last_name = models.CharField(_('Last Name'), max_length=255, blank=True)
     username = models.CharField(_('Username'), max_length=255, blank=True)
@@ -3365,23 +4218,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     last_login = models.DateTimeField(_('Last login'), null=True, blank=True)
     
     # Profile Fields
-    type = models.CharField(
-        max_length=20,
-        choices=UserType.choices,
-        null=True,
-        blank=True
-    )
-    role = models.CharField(
-        max_length=20,
-        choices=UserRole.choices,
-        null=True,
-        blank=True
-    )
-    preferred_language = models.CharField(
-        max_length=2,
-        choices=Language.choices,
-        default=Language.RUSSIAN
-    )
+    type = models.CharField(max_length=20, choices=UserType.choices, null=True, blank=True)
+    role = models.CharField(max_length=20, choices=UserRole.choices, null=True, blank=True)
+    preferred_language = models.CharField(max_length=2, choices=Language.choices, default=Language.RUSSIAN)
     
     # Contact Information
     phone_number = models.CharField(max_length=20, null=True, blank=True)
@@ -3390,11 +4229,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     # Company Information
     company_name = models.CharField(max_length=255, null=True, blank=True)
     position = models.CharField(max_length=100, null=True, blank=True)
-    registration_certificate = models.FileField(
-        upload_to='certificates/',
-        null=True,
-        blank=True
-    )
+    registration_certificate = models.FileField(upload_to='certificates/', null=True, blank=True)
     
     # Student Information
     student_id = models.CharField(max_length=50, null=True, blank=True)
@@ -3402,11 +4237,19 @@ class User(AbstractBaseUser, PermissionsMixin):
     study_language = models.CharField(max_length=50, null=True, blank=True)
     curator_name = models.CharField(max_length=100, null=True, blank=True)
     end_date = models.DateField(null=True, blank=True)
+    tariff = models.CharField(max_length=20, choices=StudentTariff.choices, null=True, blank=True)
 
-    # Verification
+    # Verification Fields
     verification_date = models.DateTimeField(null=True, blank=True)
     verification_status = models.CharField(max_length=50, null=True, blank=True)
     verification_notes = models.TextField(null=True, blank=True)
+    verified_by = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='verified_users'
+    )
     
     # Rating
     rating = models.DecimalField(
@@ -3419,9 +4262,6 @@ class User(AbstractBaseUser, PermissionsMixin):
         ]
     )
 
-    # History
-    history = HistoricalRecords()
-
     objects = CustomUserManager()
 
     USERNAME_FIELD = 'telegram_id'
@@ -3431,11 +4271,6 @@ class User(AbstractBaseUser, PermissionsMixin):
         verbose_name = _('user')
         verbose_name_plural = _('users')
         ordering = ['-date_joined']
-        indexes = [
-            models.Index(fields=['telegram_id']),
-            models.Index(fields=['role']),
-            models.Index(fields=['type']),
-        ]
 
     def __str__(self):
         return f"{self.get_full_name()} ({self.telegram_id})"
@@ -3593,7 +4428,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'company_name', 'position', 'student_id', 'group_name',
             'study_language', 'curator_name', 'end_date', 'rating',
             'rating_count', 'is_verified', 'verification_date',
-            'documents', 'date_joined', 'last_login'
+            'documents', 'date_joined', 'last_login', 'tariff'
         ]
         read_only_fields = [
             'telegram_id', 'rating', 'is_verified',
@@ -3617,7 +4452,7 @@ class UserUpdateSerializer(serializers.ModelSerializer):
             'phone_number', 'whatsapp_number', 'preferred_language',
             'company_name', 'position', 'type', 'role',
             'student_id', 'group_name', 'study_language',
-            'curator_name', 'end_date'
+            'curator_name', 'end_date', 'tariff'
         ]
     
     def validate(self, data):
@@ -3689,15 +4524,6 @@ class UserVerificationSerializer(serializers.Serializer):
             instance.verification_date = timezone.now()
         instance.save()
         return instance
-```
-
-# users\tests.py
-
-```py
-from django.test import TestCase
-
-# Create your tests here.
-
 ```
 
 # users\urls.py
@@ -3795,6 +4621,7 @@ class UserViewSet(viewsets.GenericViewSet):
                     is_active=True,
                     type=user_data.get('type'),
                     role=user_data.get('role'),
+                    tariff=user_data.get('tariff'),
                     preferred_language=user_data.get('preferred_language'),
                     phone_number=user_data.get('phoneNumber'),
                     whatsapp_number=user_data.get('whatsappNumber'),
@@ -4752,15 +5579,6 @@ class VehicleVerificationSerializer(serializers.ModelSerializer):
         return super().update(instance, validated_data)
 ```
 
-# vehicles\tests.py
-
-```py
-from django.test import TestCase
-
-# Create your tests here.
-
-```
-
 # vehicles\urls.py
 
 ```py
@@ -5059,4 +5877,3 @@ class VehicleDocumentViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(document)
         return Response(serializer.data)
 ```
-

@@ -9,11 +9,11 @@ from django.utils.html import format_html
 class CustomUserAdmin(UserAdmin):
     list_display = (
         'telegram_id', 'get_full_name', 'username', 'role',
-        'type', 'rating', 'is_active', 'is_verified'
+        'type', 'rating', 'is_active', 'is_verified', 'tariff'
     )
     list_filter = (
         'is_active', 'is_verified', 'role', 'type',
-        'date_joined', 'last_login'
+        'date_joined', 'last_login', 'tariff'
     )
     search_fields = (
         'telegram_id', 'first_name', 'last_name',
@@ -25,13 +25,13 @@ class CustomUserAdmin(UserAdmin):
         (None, {
             'fields': (
                 'telegram_id', 'first_name', 'last_name',
-                'username', 'language_code'
+                'username', 'language_code', 
             )
         }),
         (_('Profile'), {
             'fields': (
                 'type', 'role', 'preferred_language',
-                'phone_number', 'whatsapp_number'
+                'phone_number', 'whatsapp_number',
             )
         }),
         (_('Company Info'), {
@@ -42,7 +42,7 @@ class CustomUserAdmin(UserAdmin):
         (_('Student Info'), {
             'fields': (
                 'student_id', 'group_name', 'study_language',
-                'curator_name', 'end_date'
+                'curator_name', 'end_date',  'tariff'
             )
         }),
         (_('Status'), {

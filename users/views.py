@@ -73,6 +73,7 @@ class UserViewSet(viewsets.GenericViewSet):
                     is_active=True,
                     type=user_data.get('type'),
                     role=user_data.get('role'),
+                    tariff=user_data.get('tariff'),
                     preferred_language=user_data.get('preferred_language'),
                     phone_number=user_data.get('phoneNumber'),
                     whatsapp_number=user_data.get('whatsappNumber'),

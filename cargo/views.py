@@ -1,9 +1,11 @@
+from decimal import Decimal
 from rest_framework import viewsets, status, permissions, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 
 from users.models import User
@@ -32,6 +34,16 @@ from core.permissions import (
     IsLogisticsCompany,
     IsCargoOwner
 )
+import hashlib
+from drf_spectacular.types import OpenApiTypes
+from django.conf import settings
+from rest_framework.permissions import AllowAny
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+
 
 class ManagerCargoViewSet(viewsets.ModelViewSet):
     """ViewSet for manager operations on cargo"""
@@ -124,43 +136,79 @@ class ManagerCargoViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
     
 class ExternalCargoViewSet(viewsets.GenericViewSet):
-    """ViewSet for external cargo creation"""
-    permission_classes = [permissions.AllowAny]
-    serializer_class = ExternalCargoCreateSerializer
+    """ViewSet for external cargo creation via API"""
+    permission_classes = [AllowAny]
+    # serializer_class = CargoSerializer
 
     @action(detail=False, methods=['post'])
     def create_external(self, request):
         """
-        Create a cargo from external source (Telegram/API)
-        Requires valid API key for authentication
+        Create cargo entries from external API
+        Requires authentication with API key and hash verification
         """
-        serializer = self.get_serializer(data=request.data)
-        
         try:
-            serializer.is_valid(raise_exception=True)
+            # Extract data from request
+            api_key = request.data.get('api_key')
+            created_at = request.data.get('created_at')
+            received_hash = request.data.get('hash')
+            orders = request.data.get('orders', [])
+
+            # Check for required fields
+            if not all([api_key, created_at, received_hash, orders]):
+                return Response(
+                    {'error': 'Missing required fields'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+            # Verify hash
+            private_key = settings.PRIVATE_API_KEY
+            calculated_hash = hashlib.md5(
+                (private_key + api_key + str(created_at)).encode()
+            ).hexdigest()
             
-            # Get or create system user for external cargos
-            system_user, _ = User.objects.get_or_create(
-                username='system',
-                defaults={
-                    'first_name': 'System',
-                    'is_active': True,
-                    'is_verified': True,
-                    'role': 'logistics-company'
-                }
-            )
+            if calculated_hash != received_hash:
+                return Response(
+                    {'error': 'Invalid authentication'},
+                    status=status.HTTP_401_UNAUTHORIZED
+                )
             
-            # Create cargo with system user as owner
-            cargo = Cargo.objects.create(
-                owner=system_user,
-                **serializer.validated_data
-            )
+            created_cargos = []
+            errors = []
+            
+            # Process each order
+            for order_data in orders:
+                try:
+                    # Convert string numeric values to proper types
+                    cleaned_data = self._convert_data_types(order_data)
+                    
+                    # Set source type to external API if not provided
+                    if 'source_type' not in cleaned_data:
+                        cleaned_data['source_type'] = 'api'
+                    
+                    cargo = Cargo.objects.create(
+                        status='pending',  # Use string to match choices
+                        **cleaned_data
+                    )
+                    
+                    created_cargos.append({
+                        'id': cargo.id,
+                        'title': cargo.title,
+                        'source_id': cargo.source_id
+                    })
+                    
+                except Exception as e:
+                    errors.append({
+                        'order': order_data.get('source_id', 'Unknown'),
+                        'error': str(e)
+                    })
             
             return Response(
                 {
-                    'id': cargo.id,
                     'status': 'success',
-                    'message': 'Cargo created successfully'
+                    'created': len(created_cargos),
+                    'errors': len(errors),
+                    'cargos': created_cargos,
+                    'error_details': errors
                 },
                 status=status.HTTP_201_CREATED
             )
@@ -173,6 +221,26 @@ class ExternalCargoViewSet(viewsets.GenericViewSet):
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+    def _convert_data_types(self, data):
+        """Convert string values to appropriate data types"""
+        result = {}
+        for key, value in data.items():
+            if key in ['weight', 'volume', 'length', 'width', 'height', 'price'] and value:
+                try:
+                    result[key] = Decimal(str(value))
+                except (ValueError, TypeError):
+                    result[key] = None
+            elif key == 'loading_date' and value:
+                try:
+                    result[key] = parse_date(str(value))
+                except (ValueError, TypeError):
+                    result[key] = None
+            elif key in ['is_constant', 'is_ready']:
+                result[key] = bool(value)
+            else:
+                result[key] = value
+        return result
         
 class CarrierRequestViewSet(viewsets.ModelViewSet):
     """ViewSet for carrier requests"""
@@ -501,6 +569,16 @@ class CargoViewSet(viewsets.ModelViewSet):
                 description='Unloading point'
             ),
             OpenApiParameter(
+                name='loading_location_id',
+                type=int,
+                description='Loading location ID'
+            ),
+            OpenApiParameter(
+                name='unloading_location_id',
+                type=int,
+                description='Unloading location ID'
+            ),
+            OpenApiParameter(
                 name='date_from',
                 type=str,
                 description='Loading date from'
@@ -514,6 +592,11 @@ class CargoViewSet(viewsets.ModelViewSet):
                 name='vehicle_type',
                 type=str,
                 description='Vehicle type'
+            ),
+            OpenApiParameter(
+                name='radius',
+                type=int,
+                description='Search radius in kilometers'
             ),
         ],
         responses={200: CargoListSerializer(many=True)}
@@ -531,7 +614,80 @@ class CargoViewSet(viewsets.ModelViewSet):
                 Q(description__icontains=q)
             )
         
-        # Filter by location
+        # Get radius parameter
+        radius = request.query_params.get('radius', None)
+        if radius:
+            try:
+                radius = int(radius)
+            except (ValueError, TypeError):
+                radius = None
+        
+        # Filter by location ID with radius support
+        loading_location_id = request.query_params.get('loading_location_id', '')
+        if loading_location_id:
+            try:
+                from core.models import Location
+                from django.db.models import Q
+                
+                # Проверяем, существует ли локация
+                location = Location.objects.filter(id=loading_location_id).first()
+                
+                if location and radius and location.latitude and location.longitude:
+                    # Get all locations within radius
+                    from core.services.location import LocationService
+                    locations_in_radius = LocationService.find_locations_in_radius(
+                        float(location.latitude),
+                        float(location.longitude),
+                        radius
+                    )
+                    location_ids = [loc['id'] for loc in locations_in_radius]
+                    
+                    if location_ids:
+                        queryset = queryset.filter(
+                            Q(loading_location__in=location_ids) |
+                            Q(loading_location=location.id)
+                        )
+                else:
+                    # Direct location match
+                    queryset = queryset.filter(loading_location=loading_location_id)
+            except Exception as e:
+                logger.error(f"Error in loading_location search: {str(e)}")
+                # Fallback to text search if location not found or error occurs
+                pass
+        
+        unloading_location_id = request.query_params.get('unloading_location_id', '')
+        if unloading_location_id:
+            try:
+                from core.models import Location
+                from django.db.models import Q
+                
+                # Проверяем, существует ли локация
+                location = Location.objects.filter(id=unloading_location_id).first()
+                
+                if location and radius and location.latitude and location.longitude:
+                    # Get all locations within radius
+                    from core.services.location import LocationService
+                    locations_in_radius = LocationService.find_locations_in_radius(
+                        float(location.latitude),
+                        float(location.longitude),
+                        radius
+                    )
+                    location_ids = [loc['id'] for loc in locations_in_radius]
+                    
+                    if location_ids:
+                        queryset = queryset.filter(
+                            Q(unloading_location__in=location_ids) |
+                            Q(unloading_location=location.id)
+                        )
+                else:
+                    # Direct location match
+                    queryset = queryset.filter(unloading_location=unloading_location_id)
+            except Exception as e:
+                logger.error(f"Error in unloading_location search: {str(e)}")
+                # Fallback to text search if location not found or error occurs
+                pass
+        
+        # Filter by text location (for backward compatibility)
         from_location = request.query_params.get('from_location', '')
         if from_location:
             queryset = queryset.filter(
@@ -568,6 +724,7 @@ class CargoViewSet(viewsets.ModelViewSet):
             
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+
 
     @extend_schema(
         description='Get cargo statistics',

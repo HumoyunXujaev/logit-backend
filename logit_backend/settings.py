@@ -13,7 +13,8 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'your-secret-key-for-development')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DJANGO_DEBUG', 'True') == 'True'
-EXTERNAL_API_KEY = os.getenv('EXTERNAL_API_KEY', 'test')
+PRIVATE_API_KEY = os.getenv('PRIVATE_API_KEY', 'testp')
+EXTERNAL_API_KEY = os.getenv('EXTERNAL_API_KEY', 'testpb')
 
 ALLOWED_HOSTS = ['*']
 # os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,https://f623-84-54-80-95.ngrok-free.app,http://localhost:3000,').split(',')
@@ -179,6 +180,7 @@ CORS_ALLOWED_ORIGINS = [
     # '*',  # Allow all origins
     'http://localhost:3000',
     'http://127.0.0.1:3000',
+    'https://e79e-213-230-76-173.ngrok-free.app',
     'https://d0af-94-230-229-138.ngrok-free.app',
     'https://f623-84-54-80-95.ngrok-free.app',      
 

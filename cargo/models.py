@@ -31,6 +31,23 @@ class CarrierRequest(models.Model):
     # Route Information
     loading_point = models.CharField(max_length=255)
     unloading_point = models.CharField(max_length=255)
+
+     # Новые поля для связи с Location
+    loading_location = models.ForeignKey(
+        'core.Location',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='carrier_loading_requests'
+    )
+    unloading_location = models.ForeignKey(
+        'core.Location',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='carrier_unloading_requests'
+    )
+
     ready_date = models.DateField()
     vehicle_count = models.PositiveIntegerField(default=1)
     
@@ -84,20 +101,34 @@ class CarrierRequest(models.Model):
     def __str__(self):
         return f"Request from {self.carrier.get_full_name()} ({self.loading_point} - {self.unloading_point})"
 
+    # def notify_users(self, recipients, message):
+    #     """Send notification to multiple users"""
+    #     from core.services.telegram import telegram_service
+        
+    #     # Create list of (chat_id, message) tuples for users with telegram_id
+    #     messages = [
+    #         (user.telegram_id, message)
+    #         for user in recipients
+    #         if user.telegram_id
+    #     ]
+        
+    #     # Send messages if we have any recipients
+    #     if messages:
+    #         telegram_service.send_bulk_messages(messages)
     def notify_users(self, recipients, message):
         """Send notification to multiple users"""
         from core.services.telegram import telegram_service
         
-        # Create list of (chat_id, message) tuples for users with telegram_id
         messages = [
-            (user.telegram_id, message)
+            {"telegram_id": user.telegram_id, "message": message}
             for user in recipients
-            if user.telegram_id
+            if user is not None and user.telegram_id  # Check if user is None before accessing telegram_id
         ]
         
         # Send messages if we have any recipients
         if messages:
-            telegram_service.send_bulk_messages(messages)
+            telegram_service.send_bulk_messages.delay(messages)
+
 
     def save(self, *args, **kwargs):
         """Override save to handle notifications"""
@@ -237,6 +268,29 @@ class Cargo(models.Model):
         blank=True
     )
     
+    loading_location = models.ForeignKey(
+        'core.Location',
+        on_delete=models.PROTECT,
+        related_name='loading_cargos',
+        null=True,
+        blank=True
+    )
+    unloading_location = models.ForeignKey(
+        'core.Location',
+        on_delete=models.PROTECT,
+        related_name='unloading_cargos',
+        null=True,
+        blank=True
+    )
+    
+    # Optional intermediate points
+    additional_locations = models.ManyToManyField(
+        'core.Location',
+        related_name='intermediate_cargos',
+        null=True,
+        blank=True
+    )
+
     # Route information
     loading_point = models.CharField(max_length=255)
     unloading_point = models.CharField(max_length=255)
@@ -274,7 +328,9 @@ class Cargo(models.Model):
     owner = models.ForeignKey(
         User,
         on_delete=models.CASCADE,
-        related_name='owned_cargos'
+        related_name='owned_cargos',
+        null=True,
+        blank=True,
     )
     assigned_to = models.ForeignKey(
         User,
@@ -316,20 +372,55 @@ class Cargo(models.Model):
     approval_date = models.DateTimeField(null=True, blank=True)
     approval_notes = models.TextField(null=True, blank=True)
     
+    def get_distance(self):
+        """Calculate total route distance in km"""
+        from math import radians, sin, cos, sqrt, atan2
+        
+        def haversine(lat1, lon1, lat2, lon2):
+            R = 6371  # Earth's radius in km
+            
+            lat1, lon1 = map(radians, [float(lat1), float(lon1)])
+            lat2, lon2 = map(radians, [float(lat2), float(lon2)])
+            
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            
+            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+            c = 2 * atan2(sqrt(a), sqrt(1-a))
+            return R * c
+
+        total_distance = 0
+        prev_location = self.loading_location
+        
+        # Add intermediate points if they exist
+        locations = list(self.additional_locations.all())
+        locations.append(self.unloading_location)
+        
+        for location in locations:
+            if prev_location.latitude and prev_location.longitude and \
+               location.latitude and location.longitude:
+                distance = haversine(
+                    prev_location.latitude, prev_location.longitude,
+                    location.latitude, location.longitude
+                )
+                total_distance += distance
+            prev_location = location
+            
+        return round(total_distance)
+    
     def notify_users(self, recipients, message):
         """Send notification to multiple users"""
         from core.services.telegram import telegram_service
         
-        # Create list of (chat_id, message) tuples for users with telegram_id
         messages = [
-            (user.telegram_id, message)
+            {"telegram_id": user.telegram_id, "message": message}
             for user in recipients
-            if user.telegram_id
+            if user is not None and user.telegram_id  # Check if user is None before accessing telegram_id
         ]
         
         # Send messages if we have any recipients
         if messages:
-            telegram_service.send_bulk_messages(messages)
+            telegram_service.send_bulk_messages.delay(messages)
 
     def save(self, *args, **kwargs):
         """Override save to handle volume calculation and notifications"""

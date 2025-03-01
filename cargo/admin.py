@@ -3,7 +3,7 @@ from django.utils.translation import gettext_lazy as _
 from django.utils.html import format_html
 from .models import Cargo, CargoDocument, CargoStatusHistory, CarrierRequest
 
-admin.register(CarrierRequest)
+@admin.register(CarrierRequest)
 class CarrierRequestAdmin(admin.ModelAdmin):
     list_display = (
         'carrier', 'vehicle', 'loading_point',
@@ -49,7 +49,7 @@ class CargoAdmin(admin.ModelAdmin):
         'title', 'description', 'loading_point',
         'unloading_point', 'owner__username'
     )
-    raw_id_fields = ['owner']
+    raw_id_fields = ['owner', 'loading_location', 'unloading_location']
     ordering = ['-created_at']
     date_hierarchy = 'created_at'
     
@@ -70,7 +70,7 @@ class CargoAdmin(admin.ModelAdmin):
         (_('Route'), {
             'fields': (
                 'loading_point', 'unloading_point',
-                'additional_points'
+                'additional_points', 'loading_location', 'unloading_location'
             )
         }),
         (_('Schedule'), {
@@ -93,7 +93,7 @@ class CargoAdmin(admin.ModelAdmin):
                 'source_type', 'source_id', 'views_count',
                 'created_at', 'updated_at'
             )
-        }),
+        })
     )
     
     readonly_fields = [

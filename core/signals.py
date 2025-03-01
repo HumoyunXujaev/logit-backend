@@ -53,39 +53,85 @@ def send_telegram_notification(sender, instance, created, **kwargs):
     except Exception as e:
         logger.error(f"Failed to send Telegram notification: {str(e)}")
 
+
 @receiver(post_save, sender=Cargo)
 def notify_cargo_status_change(sender, instance, created, **kwargs):
-    """Create notifications for cargo status changes"""
+    """Send notifications for cargo status changes"""
     if created:
         return
         
-    if instance.tracker.has_changed('status'):
-        old_status = instance.tracker.previous('status')
+    # We can't use tracker since it's not configured
+    # Instead, we'll check for status changes based on the "_original_status" 
+    # attribute which is set in pre_save in cargo/signals.py
+    if hasattr(instance, '_original_status') and instance._original_status != instance.status:
+        old_status = instance._original_status
         new_status = instance.status
         
         # Determine who should be notified
         recipients = []
+        action = ""
         
         if new_status == 'pending_approval':
             # Notify managers
-            recipients = User.objects.filter(role='manager', is_active=True)
-            message = f"Новый груз требует проверки: {instance.title}"
+            recipients = User.objects.filter(
+                role='manager',
+                is_active=True,
+                telegram_id__isnull=False
+            )
+            action = f"Новый груз требует проверки: {instance.title}"
             
         elif new_status == 'manager_approved':
             # Notify students
-            recipients = User.objects.filter(role='student', is_active=True)
-            message = f"Новый груз доступен: {instance.title}"
+            recipients = User.objects.filter(
+                role='student',
+                is_active=True,
+                telegram_id__isnull=False
+            )
+            action = f"Новый груз доступен: {instance.title}"
             
         elif new_status == 'assigned':
             # Notify carrier
-            recipients = [instance.assigned_to]
-            message = f"Вам назначен груз: {instance.title}"
-            
-        # Create notifications
-        for recipient in recipients:
-            Notification.objects.create(
-                user=recipient,
-                type='cargo',
-                message=message,
-                content_object=instance
-            )
+            if instance.assigned_to and instance.assigned_to.telegram_id:
+                recipients = [instance.assigned_to]
+                action = f"Вам назначен груз: {instance.title}"
+
+        # Send notifications via Telegram
+        if recipients and action:
+            for recipient in recipients:
+                if recipient.telegram_id:
+                    telegram_service.send_notification.delay(
+                        recipient.telegram_id, 
+                        telegram_service.format_cargo_notification(instance, action)
+                    )
+
+@receiver(post_save, sender=CarrierRequest)
+def notify_carrier_request_status_change(sender, instance, created, **kwargs):
+    """Send notifications for carrier request status changes"""
+    if created:
+        return
+        
+    if hasattr(instance, '_original_status') and instance._original_status != instance.status:
+        old_status = instance._original_status
+        new_status = instance.status
+        
+        recipients = []
+        action = ""
+        
+        if new_status == 'assigned':
+            if instance.carrier and instance.carrier.telegram_id:
+                recipients = [instance.carrier]
+                action = "Вам назначен груз"
+                
+        elif new_status in ['accepted', 'rejected']:
+            if instance.assigned_by and instance.assigned_by.telegram_id:
+                recipients = [instance.assigned_by]
+                action = f"Перевозчик {'принял' if new_status == 'accepted' else 'отклонил'} назначенный груз"
+
+        # Send notifications via Telegram
+        if recipients and action:
+            for recipient in recipients:
+                if recipient.telegram_id:
+                    telegram_service.send_notification.delay(
+                        recipient.telegram_id,
+                        telegram_service.format_carrier_notification(instance, action)
+                    )

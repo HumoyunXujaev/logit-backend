@@ -6,7 +6,7 @@ from django.utils.translation import gettext_lazy as _
 from django.utils.html import format_html
 from .models import Cargo, CargoDocument, CargoStatusHistory, CarrierRequest
 
-admin.register(CarrierRequest)
+@admin.register(CarrierRequest)
 class CarrierRequestAdmin(admin.ModelAdmin):
     list_display = (
         'carrier', 'vehicle', 'loading_point',
@@ -52,7 +52,7 @@ class CargoAdmin(admin.ModelAdmin):
         'title', 'description', 'loading_point',
         'unloading_point', 'owner__username'
     )
-    raw_id_fields = ['owner']
+    raw_id_fields = ['owner', 'loading_location', 'unloading_location']
     ordering = ['-created_at']
     date_hierarchy = 'created_at'
     
@@ -73,7 +73,7 @@ class CargoAdmin(admin.ModelAdmin):
         (_('Route'), {
             'fields': (
                 'loading_point', 'unloading_point',
-                'additional_points'
+                'additional_points', 'loading_location', 'unloading_location'
             )
         }),
         (_('Schedule'), {
@@ -96,7 +96,7 @@ class CargoAdmin(admin.ModelAdmin):
                 'source_type', 'source_id', 'views_count',
                 'created_at', 'updated_at'
             )
-        }),
+        })
     )
     
     readonly_fields = [
@@ -214,10 +214,12 @@ class CargoStatusHistoryAdmin(admin.ModelAdmin):
 ```py
 from django.apps import AppConfig
 
-
 class CargoConfig(AppConfig):
     default_auto_field = 'django.db.models.BigAutoField'
     name = 'cargo'
+    
+    def ready(self):
+        import cargo.signals  # Import signals when app is ready
 
 ```
 
@@ -227,6 +229,8 @@ class CargoConfig(AppConfig):
 import django_filters
 from django.db.models import Q
 from .models import Cargo
+from core.models import Location
+from math import radians, cos, sin, asin, sqrt
 
 class CargoFilter(django_filters.FilterSet):
     min_weight = django_filters.NumberFilter(
@@ -262,6 +266,33 @@ class CargoFilter(django_filters.FilterSet):
         lookup_expr='lte'
     )
     
+    # Фильтры для Location
+    loading_location = django_filters.ModelChoiceFilter(
+        queryset=Location.objects.filter(level=3),
+        field_name='loading_location'
+    )
+    unloading_location = django_filters.ModelChoiceFilter(
+        queryset=Location.objects.filter(level=3),
+        field_name='unloading_location'
+    )
+    loading_country = django_filters.ModelChoiceFilter(
+        queryset=Location.objects.filter(level=1),
+        method='filter_loading_country'
+    )
+    unloading_country = django_filters.ModelChoiceFilter(
+        queryset=Location.objects.filter(level=1),
+        method='filter_unloading_country'
+    )
+    loading_state = django_filters.ModelChoiceFilter(
+        queryset=Location.objects.filter(level=2),
+        method='filter_loading_state'
+    )
+    unloading_state = django_filters.ModelChoiceFilter(
+        queryset=Location.objects.filter(level=2),
+        method='filter_unloading_state'
+    )
+    
+    # Старые текстовые фильтры (для совместимости)
     location = django_filters.CharFilter(method='filter_location')
     radius = django_filters.NumberFilter(method='filter_radius')
     
@@ -291,11 +322,136 @@ class CargoFilter(django_filters.FilterSet):
     def filter_radius(self, queryset, name, value):
         """
         Filter by radius around loading or unloading point
-        Placeholder - implement actual geo radius search
+        Uses Location objects if specified, otherwise falls back to text search
         """
-        # TODO: Implement actual geo radius search using PostGIS
-        # For now, return unfiltered queryset
-        return queryset
+        if not value:
+            return queryset
+            
+        # Получаем параметры из запроса
+        request = self.request
+        if not request:
+            return queryset
+            
+        # Фильтруем по загрузке
+        filtered_queryset = queryset
+        
+        # Проверяем если есть loading_location_id
+        loading_location_id = request.query_params.get('loading_location_id')
+        if loading_location_id:
+            try:
+                # Получаем локацию
+                location = Location.objects.get(id=loading_location_id)
+                if location.latitude and location.longitude:
+                    # Фильтруем грузы в радиусе
+                    locations_in_radius = self._get_locations_in_radius(
+                        location.latitude, location.longitude, value
+                    )
+                    filtered_queryset = filtered_queryset.filter(
+                        loading_location__in=locations_in_radius
+                    )
+            except Location.DoesNotExist:
+                pass
+                
+        # Проверяем если есть unloading_location_id
+        unloading_location_id = request.query_params.get('unloading_location_id')
+        if unloading_location_id:
+            try:
+                # Получаем локацию
+                location = Location.objects.get(id=unloading_location_id)
+                if location.latitude and location.longitude:
+                    # Фильтруем грузы в радиусе
+                    locations_in_radius = self._get_locations_in_radius(
+                        location.latitude, location.longitude, value
+                    )
+                    filtered_queryset = filtered_queryset.filter(
+                        unloading_location__in=locations_in_radius
+                    )
+            except Location.DoesNotExist:
+                pass
+                
+        return filtered_queryset
+    
+    def filter_loading_country(self, queryset, name, value):
+        """Фильтр по стране загрузки"""
+        if not value:
+            return queryset
+        
+        # Ищем все Location с указанной страной
+        return queryset.filter(
+            Q(loading_location__country=value) |
+            Q(loading_location=value)  # Если сама страна выбрана как локация
+        )
+    
+    def filter_unloading_country(self, queryset, name, value):
+        """Фильтр по стране выгрузки"""
+        if not value:
+            return queryset
+        
+        # Ищем все Location с указанной страной
+        return queryset.filter(
+            Q(unloading_location__country=value) |
+            Q(unloading_location=value)  # Если сама страна выбрана как локация
+        )
+    
+    def filter_loading_state(self, queryset, name, value):
+        """Фильтр по региону/штату загрузки"""
+        if not value:
+            return queryset
+        
+        # Ищем все Location с указанным регионом или который является регионом
+        return queryset.filter(
+            Q(loading_location__parent=value) |
+            Q(loading_location=value)  # Если сам штат выбран как локация
+        )
+    
+    def filter_unloading_state(self, queryset, name, value):
+        """Фильтр по региону/штату выгрузки"""
+        if not value:
+            return queryset
+        
+        # Ищем все Location с указанным регионом или который является регионом
+        return queryset.filter(
+            Q(unloading_location__parent=value) |
+            Q(unloading_location=value)  # Если сам штат выбран как локация
+        )
+    
+    def _get_locations_in_radius(self, lat, lon, radius_km):
+        """
+        Получить все локации в указанном радиусе
+        Используем формулу Гаверсинуса для расчета расстояния
+        """
+        locations = []
+        
+        # Получаем все локации уровня 3 (города)
+        cities = Location.objects.filter(level=3)
+        
+        for city in cities:
+            if city.latitude and city.longitude:
+                distance = self._haversine(
+                    float(lat), float(lon),
+                    float(city.latitude), float(city.longitude)
+                )
+                if distance <= radius_km:
+                    locations.append(city.id)
+        
+        return locations
+    
+    def _haversine(self, lat1, lon1, lat2, lon2):
+        """
+        Расчет расстояния между двумя точками по формуле Гаверсинуса
+        Результат в километрах
+        """
+        # Конвертируем градусы в радианы
+        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+        
+        # Формула Гаверсинуса
+        dlon = lon2 - lon1
+        dlat = lat2 - lat1
+        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+        c = 2 * asin(sqrt(a))
+        r = 6371  # Радиус Земли в километрах
+        
+        return c * r
 ```
 
 # cargo\models.py
@@ -334,6 +490,23 @@ class CarrierRequest(models.Model):
     # Route Information
     loading_point = models.CharField(max_length=255)
     unloading_point = models.CharField(max_length=255)
+
+     # Новые поля для связи с Location
+    loading_location = models.ForeignKey(
+        'core.Location',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='carrier_loading_requests'
+    )
+    unloading_location = models.ForeignKey(
+        'core.Location',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='carrier_unloading_requests'
+    )
+
     ready_date = models.DateField()
     vehicle_count = models.PositiveIntegerField(default=1)
     
@@ -387,20 +560,34 @@ class CarrierRequest(models.Model):
     def __str__(self):
         return f"Request from {self.carrier.get_full_name()} ({self.loading_point} - {self.unloading_point})"
 
+    # def notify_users(self, recipients, message):
+    #     """Send notification to multiple users"""
+    #     from core.services.telegram import telegram_service
+        
+    #     # Create list of (chat_id, message) tuples for users with telegram_id
+    #     messages = [
+    #         (user.telegram_id, message)
+    #         for user in recipients
+    #         if user.telegram_id
+    #     ]
+        
+    #     # Send messages if we have any recipients
+    #     if messages:
+    #         telegram_service.send_bulk_messages(messages)
     def notify_users(self, recipients, message):
         """Send notification to multiple users"""
         from core.services.telegram import telegram_service
         
-        # Create list of (chat_id, message) tuples for users with telegram_id
         messages = [
-            (user.telegram_id, message)
+            {"telegram_id": user.telegram_id, "message": message}
             for user in recipients
-            if user.telegram_id
+            if user is not None and user.telegram_id  # Check if user is None before accessing telegram_id
         ]
         
         # Send messages if we have any recipients
         if messages:
-            telegram_service.send_bulk_messages(messages)
+            telegram_service.send_bulk_messages.delay(messages)
+
 
     def save(self, *args, **kwargs):
         """Override save to handle notifications"""
@@ -540,6 +727,29 @@ class Cargo(models.Model):
         blank=True
     )
     
+    loading_location = models.ForeignKey(
+        'core.Location',
+        on_delete=models.PROTECT,
+        related_name='loading_cargos',
+        null=True,
+        blank=True
+    )
+    unloading_location = models.ForeignKey(
+        'core.Location',
+        on_delete=models.PROTECT,
+        related_name='unloading_cargos',
+        null=True,
+        blank=True
+    )
+    
+    # Optional intermediate points
+    additional_locations = models.ManyToManyField(
+        'core.Location',
+        related_name='intermediate_cargos',
+        null=True,
+        blank=True
+    )
+
     # Route information
     loading_point = models.CharField(max_length=255)
     unloading_point = models.CharField(max_length=255)
@@ -577,7 +787,9 @@ class Cargo(models.Model):
     owner = models.ForeignKey(
         User,
         on_delete=models.CASCADE,
-        related_name='owned_cargos'
+        related_name='owned_cargos',
+        null=True,
+        blank=True,
     )
     assigned_to = models.ForeignKey(
         User,
@@ -619,20 +831,55 @@ class Cargo(models.Model):
     approval_date = models.DateTimeField(null=True, blank=True)
     approval_notes = models.TextField(null=True, blank=True)
     
+    def get_distance(self):
+        """Calculate total route distance in km"""
+        from math import radians, sin, cos, sqrt, atan2
+        
+        def haversine(lat1, lon1, lat2, lon2):
+            R = 6371  # Earth's radius in km
+            
+            lat1, lon1 = map(radians, [float(lat1), float(lon1)])
+            lat2, lon2 = map(radians, [float(lat2), float(lon2)])
+            
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            
+            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+            c = 2 * atan2(sqrt(a), sqrt(1-a))
+            return R * c
+
+        total_distance = 0
+        prev_location = self.loading_location
+        
+        # Add intermediate points if they exist
+        locations = list(self.additional_locations.all())
+        locations.append(self.unloading_location)
+        
+        for location in locations:
+            if prev_location.latitude and prev_location.longitude and \
+               location.latitude and location.longitude:
+                distance = haversine(
+                    prev_location.latitude, prev_location.longitude,
+                    location.latitude, location.longitude
+                )
+                total_distance += distance
+            prev_location = location
+            
+        return round(total_distance)
+    
     def notify_users(self, recipients, message):
         """Send notification to multiple users"""
         from core.services.telegram import telegram_service
         
-        # Create list of (chat_id, message) tuples for users with telegram_id
         messages = [
-            (user.telegram_id, message)
+            {"telegram_id": user.telegram_id, "message": message}
             for user in recipients
-            if user.telegram_id
+            if user is not None and user.telegram_id  # Check if user is None before accessing telegram_id
         ]
         
         # Send messages if we have any recipients
         if messages:
-            telegram_service.send_bulk_messages(messages)
+            telegram_service.send_bulk_messages.delay(messages)
 
     def save(self, *args, **kwargs):
         """Override save to handle volume calculation and notifications"""
@@ -839,6 +1086,8 @@ from users.serializers import UserProfileSerializer
 from .models import Cargo, CarrierRequest, CargoDocument
 from vehicles.serializers import VehicleSerializer
 from django.conf import settings
+from core.serializers import LocationListSerializer, LocationDetailSerializer
+from core.models import Location
 
 class CargoApprovalSerializer(serializers.ModelSerializer):
     """Serializer for manager approval/rejection of cargo"""
@@ -858,12 +1107,24 @@ class CargoApprovalSerializer(serializers.ModelSerializer):
 
 class ManagerCargoUpdateSerializer(serializers.ModelSerializer):
     """Serializer for managers to update cargo details"""
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    
     class Meta:
         model = Cargo
         fields = [
             'title', 'description', 'weight',
             'volume', 'length', 'width', 'height',
             'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'additional_points', 'loading_date',
             'is_constant', 'is_ready', 'vehicle_type',
             'loading_type', 'payment_method', 'price',
@@ -894,6 +1155,16 @@ class ExternalCargoCreateSerializer(serializers.ModelSerializer):
     api_key = serializers.CharField(write_only=True)
     source_type = serializers.ChoiceField(choices=Cargo.SourceType.choices)
     source_id = serializers.CharField(required=True)
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
 
     class Meta:
         model = Cargo
@@ -901,6 +1172,7 @@ class ExternalCargoCreateSerializer(serializers.ModelSerializer):
             'title', 'description', 'weight',
             'volume', 'length', 'width', 'height',
             'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'additional_points', 'loading_date',
             'is_constant', 'is_ready', 'vehicle_type',
             'loading_type', 'payment_method', 'price',
@@ -957,12 +1229,15 @@ class CarrierRequestSerializer(serializers.ModelSerializer):
     assigned_by = UserProfileSerializer(read_only=True)
     vehicle = VehicleSerializer(read_only=True)
     assigned_cargo = serializers.PrimaryKeyRelatedField(read_only=True)
+    loading_location = LocationDetailSerializer(read_only=True)
+    unloading_location = LocationDetailSerializer(read_only=True)
     
     class Meta:
         model = CarrierRequest
         fields = [
             'id', 'carrier', 'vehicle', 'loading_point',
-            'unloading_point', 'ready_date', 'vehicle_count',
+            'unloading_point', 'loading_location', 'unloading_location',
+            'ready_date', 'vehicle_count',
             'price_expectation', 'payment_terms', 'notes',
             'status', 'created_at', 'updated_at',
             'assigned_cargo', 'assigned_by', 'assigned_at'
@@ -971,10 +1246,22 @@ class CarrierRequestSerializer(serializers.ModelSerializer):
 
 class CarrierRequestCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating carrier requests"""
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    
     class Meta:
         model = CarrierRequest
         fields = [
             'vehicle', 'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'ready_date', 'vehicle_count', 'price_expectation',
             'payment_terms', 'notes'
         ]
@@ -995,13 +1282,37 @@ class CarrierRequestCreateSerializer(serializers.ModelSerializer):
                 "Ready date cannot be in the past"
             )
         return value
+    
+    def validate(self, data):
+        """Validate location data"""
+        # Если указан loading_location, но не указан loading_point
+        if data.get('loading_location') and not data.get('loading_point'):
+            data['loading_point'] = data['loading_location'].name
+            
+        # Если указан unloading_location, но не указан unloading_point
+        if data.get('unloading_location') and not data.get('unloading_point'):
+            data['unloading_point'] = data['unloading_location'].name
+            
+        return data
 
 class CarrierRequestUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating carrier requests"""
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    
     class Meta:
         model = CarrierRequest
         fields = [
             'vehicle', 'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'ready_date', 'vehicle_count', 'price_expectation',
             'payment_terms', 'notes', 'status'
         ]
@@ -1026,17 +1337,32 @@ class CarrierRequestUpdateSerializer(serializers.ModelSerializer):
                 )
                 
         return value
+    
+    def validate(self, data):
+        """Validate location data"""
+        # Если указан loading_location, но не указан loading_point
+        if data.get('loading_location') and not data.get('loading_point'):
+            data['loading_point'] = data['loading_location'].name
+            
+        # Если указан unloading_location, но не указан unloading_point
+        if data.get('unloading_location') and not data.get('unloading_point'):
+            data['unloading_point'] = data['unloading_location'].name
+            
+        return data
 
 class CarrierRequestListSerializer(serializers.ModelSerializer):
     """Simplified carrier request serializer for list views"""
     carrier = UserProfileSerializer(read_only=True)
     vehicle = VehicleSerializer(read_only=True)
+    loading_location = LocationListSerializer(read_only=True)
+    unloading_location = LocationListSerializer(read_only=True)
     
     class Meta:
         model = CarrierRequest
         fields = [
             'id', 'carrier', 'vehicle', 'loading_point',
-            'unloading_point', 'ready_date', 'vehicle_count',
+            'unloading_point', 'loading_location', 'unloading_location',
+            'ready_date', 'vehicle_count',
             'price_expectation', 'payment_terms', 'notes',
             'status', 'created_at', 'updated_at',
             'assigned_cargo', 'assigned_by', 'assigned_at'
@@ -1048,13 +1374,18 @@ class CargoSerializer(serializers.ModelSerializer):
     assigned_to = UserProfileSerializer(read_only=True)
     managed_by = UserProfileSerializer(read_only=True)
     carrier_requests = CarrierRequestListSerializer(many=True, read_only=True)
+    loading_location = LocationDetailSerializer(read_only=True)
+    unloading_location = LocationDetailSerializer(read_only=True)
+    additional_locations = LocationDetailSerializer(many=True, read_only=True)
 
     class Meta:
         model = Cargo
         fields = [
             'id', 'title', 'description', 'status',
             'weight', 'volume', 'length', 'width', 'height',
-            'loading_point', 'unloading_point', 'additional_points',
+            'loading_point', 'unloading_point', 
+            'loading_location', 'unloading_location', 
+            'additional_locations', 'additional_points',
             'loading_date', 'is_constant', 'is_ready',
             'vehicle_type', 'loading_type',
             'payment_method', 'price', 'payment_details',
@@ -1069,12 +1400,24 @@ class CargoSerializer(serializers.ModelSerializer):
 
 class CargoCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating cargos"""
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    
     class Meta:
         model = Cargo
         fields = [
             'title', 'description', 'weight',
             'volume', 'length', 'width', 'height',
             'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'additional_points', 'loading_date',
             'is_constant', 'is_ready', 'vehicle_type',
             'loading_type', 'payment_method', 'price',
@@ -1089,44 +1432,18 @@ class CargoCreateSerializer(serializers.ModelSerializer):
             )
         return value
     
-    # def create(self, validated_data):
-    #     """Create cargo with default status based on user role"""
-    #     user = self.context['request'].user
-    #     status = 'draft'
-        
-    #     # Set initial status based on user role
-    #     if user.role in ['cargo-owner', 'logistics-company']:
-    #         status = 'pending'  # Needs logist assignment
-    #     elif user.role == 'student':
-    #         status = 'pending'  # Ready for carrier assignment
-    #         validated_data['managed_by'] = user
+    def validate(self, data):
+        """Validate location data"""
+        # Если указан loading_location, но не указан loading_point
+        if data.get('loading_location') and not data.get('loading_point'):
+            data['loading_point'] = data['loading_location'].name
             
-    #     return Cargo.objects.create(
-    #         owner=user,
-    #         status=status,
-    #         **validated_data
-    #     )
-
-    # def create(self, validated_data):
-    #     """Create cargo with default status based on user role"""
-    #     user = self.context['request'].user
-        
-    #     # Set initial status based on user role
-    #     if user.role == 'cargo-owner':
-    #         status = 'draft'  # Needs manager approval
-    #     elif user.role == 'logistics-company':
-    #         status = 'pending'  # Goes directly to students
-    #     else:
-    #         status = 'draft'  # Default status
+        # Если указан unloading_location, но не указан unloading_point
+        if data.get('unloading_location') and not data.get('unloading_point'):
+            data['unloading_point'] = data['unloading_location'].name
             
-    #     print(validated_data)
-    #     print(user)
-    #     validated_data.pop('owner', None)
-    #     return Cargo.objects.create(
-    #         owner=user,
-    #         status=status,
-    #         **validated_data
-    #     )
+        return data
+    
     def create(self, validated_data):
         """Create cargo with appropriate initial status based on user role"""
         request = self.context.get('request')
@@ -1149,16 +1466,34 @@ class CargoCreateSerializer(serializers.ModelSerializer):
         else:
             validated_data['status'] = Cargo.CargoStatus.DRAFT
 
-        return super().create(validated_data)
+        # Create the cargo
+        print("creating cargo with data: ", validated_data)
+        cargo = Cargo.objects.create(
+            # owner=user, 
+            **validated_data)
+        
+        return cargo
     
 class CargoUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating cargo"""
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    
     class Meta:
         model = Cargo
         fields = [
             'title', 'description', 'weight',
             'volume', 'length', 'width', 'height',
             'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'additional_points', 'loading_date',
             'is_constant', 'is_ready', 'vehicle_type',
             'loading_type', 'payment_method', 'price',
@@ -1207,35 +1542,43 @@ class CargoUpdateSerializer(serializers.ModelSerializer):
             )
 
         return value
+    
+    def validate(self, data):
+        """Validate location data"""
+        # Если указан loading_location, но не указан loading_point
+        if data.get('loading_location') and not data.get('loading_point'):
+            data['loading_point'] = data['loading_location'].name
+            
+        # Если указан unloading_location, но не указан unloading_point
+        if data.get('unloading_location') and not data.get('unloading_point'):
+            data['unloading_point'] = data['unloading_location'].name
+            
+        return data
 
 class CargoListSerializer(serializers.ModelSerializer):
     """Simplified cargo serializer for list views"""
     owner = UserProfileSerializer(read_only=True)
     assigned_to = UserProfileSerializer(read_only=True)
     managed_by = UserProfileSerializer(read_only=True)
-    carrier_requests = CarrierRequestListSerializer(many=True, read_only=True)
+    loading_location = LocationListSerializer(read_only=True)
+    unloading_location = LocationListSerializer(read_only=True)
 
     class Meta:
         model = Cargo
         fields = [
-            # 'id', 'title', 'status', 'weight',
-            # 'loading_point', 'unloading_point',
-            # 'loading_date', 'vehicle_type',
-            # 'payment_method', 'price', 'owner',
-            # 'assigned_to', 'managed_by', 'created_at'
             'id', 'title', 'description', 'status',
             'weight', 'volume', 'length', 'width', 'height',
-            'loading_point', 'unloading_point', 'additional_points',
-            'loading_date', 'is_constant', 'is_ready',
+            'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
+            'additional_points', 'loading_date', 'is_constant', 'is_ready',
             'vehicle_type', 'loading_type',
             'payment_method', 'price', 'payment_details',
             'owner', 'assigned_to', 'managed_by',
             'created_at', 'updated_at', 'views_count',
-            'source_type', 'source_id', 'carrier_requests'
+            'source_type', 'source_id'
         ]
         read_only_fields = [
-            'created_at', 'updated_at', 'views_count',
-            'carrier_requests'
+            'created_at', 'updated_at', 'views_count'
         ]
 
 class CargoAssignmentSerializer(serializers.ModelSerializer):
@@ -1326,142 +1669,256 @@ class CargoAcceptanceSerializer(serializers.ModelSerializer):
 
         return instance
 
-# class CargoSearchSerializer(serializers.Serializer):
-#     """Serializer for cargo search parameters"""
-#     q = serializers.CharField(required=False, allow_blank=True)
-#     from_location = serializers.CharField(required=False)
-#     to_location = serializers.CharField(required=False)
-#     min_weight = serializers.DecimalField(
-#         required=False,
-#         max_digits=10,
-#         decimal_places=2
-#     )
-#     max_weight = serializers.DecimalField(
-#         required=False,
-#         max_digits=10,
-#         decimal_places=2
-#     )
-#     date_from = serializers.DateField(required=False)
-#     date_to = serializers.DateField(required=False)
-#     vehicle_types = serializers.MultipleChoiceField(
-#         required=False,
-#         choices=Cargo.VehicleType.choices
-#     )
-#     loading_types = serializers.MultipleChoiceField(
-#         required=False,
-#         choices=Cargo.LoadingType.choices
-#     )
-#     payment_methods = serializers.MultipleChoiceField(
-#         required=False,
-#         choices=Cargo.PaymentMethod.choices
-#     )
+class CargoSearchSerializer(serializers.Serializer):
+    """Serializer for cargo search parameters"""
+    q = serializers.CharField(required=False, allow_blank=True)
+    from_location_id = serializers.IntegerField(required=False)
+    to_location_id = serializers.IntegerField(required=False)
+    from_location = serializers.CharField(required=False, allow_blank=True)
+    to_location = serializers.CharField(required=False, allow_blank=True)
+    min_weight = serializers.DecimalField(
+        required=False,
+        max_digits=10,
+        decimal_places=2
+    )
+    max_weight = serializers.DecimalField(
+        required=False,
+        max_digits=10,
+        decimal_places=2
+    )
+    date_from = serializers.DateField(required=False)
+    date_to = serializers.DateField(required=False)
+    vehicle_types = serializers.MultipleChoiceField(
+        required=False,
+        choices=Cargo.VehicleType.choices
+    )
+    loading_types = serializers.MultipleChoiceField(
+        required=False,
+        choices=Cargo.LoadingType.choices
+    )
+    payment_methods = serializers.MultipleChoiceField(
+        required=False,
+        choices=Cargo.PaymentMethod.choices
+    )
+    radius = serializers.IntegerField(required=False, min_value=0, max_value=500)
     
-#     def validate(self, data):
-#         """Validate search parameters"""
-#         if data.get('min_weight') and data.get('max_weight'):
-#             if data['min_weight'] > data['max_weight']:
-#                 raise serializers.ValidationError(
-#                     "min_weight cannot be greater than max_weight"
-#                 )
+    def validate(self, data):
+        """Validate search parameters"""
+        if data.get('min_weight') and data.get('max_weight'):
+            if data['min_weight'] > data['max_weight']:
+                raise serializers.ValidationError(
+                    "min_weight cannot be greater than max_weight"
+                )
         
-#         if data.get('date_from') and data.get('date_to'):
-#             if data['date_from'] > data['date_to']:
-#                 raise serializers.ValidationError(
-#                     "date_from cannot be later than date_to"
-#                 )
+        if data.get('date_from') and data.get('date_to'):
+            if data['date_from'] > data['date_to']:
+                raise serializers.ValidationError(
+                    "date_from cannot be later than date_to"
+                )
         
-#         return data
-
+        return data
 ```
 
 # cargo\signals.py
 
 ```py
-from django.db.models.signals import post_save
+from django.db.models.signals import post_save, post_delete, pre_save
 from django.dispatch import receiver
 from django.contrib.auth import get_user_model
 from .models import Cargo, CarrierRequest
 from core.services.telegram import telegram_service
-import asyncio
+from django.db import transaction
 
 User = get_user_model()
 
 @receiver(post_save, sender=Cargo)
-def notify_cargo_status_change(sender, instance, created, **kwargs):
-    """Send notifications for cargo status changes"""
-    if created:
+def notify_cargo_changes(sender, instance, created, **kwargs):
+    """Send notifications for cargo creation and changes"""
+    # Skip if this is not a change or the transaction is being managed elsewhere
+    if transaction.get_connection().in_atomic_block and not created:
         return
         
-    if instance.tracker.has_changed('status'):
-        old_status = instance.tracker.previous('status')
+    # Determine action and recipients based on status and event
+    if created:
+        action = f"Новый груз создан: {instance.title}"
+        
+        # Notify different users based on cargo status
+        if instance.status == Cargo.CargoStatus.PENDING_APPROVAL:
+            # Notify managers about new cargo requiring approval
+            managers = User.objects.filter(role='manager', is_active=True)
+            if managers.exists():
+                for manager in managers:
+                    if manager.telegram_id:
+                        telegram_service.send_notification.delay(
+                            manager.telegram_id,
+                            telegram_service.format_cargo_notification(instance, action)
+                        )
+            
+        elif instance.status == Cargo.CargoStatus.PENDING:
+            # Notify students about new cargo
+            students = User.objects.filter(role='student', is_active=True)
+            if students.exists():
+                for student in students:
+                    if student.telegram_id:
+                        telegram_service.send_notification.delay(
+                            student.telegram_id, 
+                            telegram_service.format_cargo_notification(instance, action)
+                        )
+            
+    elif hasattr(instance, '_original_status') and instance._original_status != instance.status:
+        old_status = instance._original_status
         new_status = instance.status
         
-        # Determine who should be notified
-        recipients = []
-        action = ""
+        action = f"Статус груза изменен с {old_status} на {new_status}: {instance.title}"
         
-        if new_status == 'pending_approval':
-            # Notify managers
-            recipients = User.objects.filter(
-                role='manager',
-                is_active=True,
-                telegram_id__isnull=False
+        # Notify owner
+        if instance.owner and instance.owner.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.owner.telegram_id,
+                telegram_service.format_cargo_notification(instance, action)
             )
-            action = f"Новый груз требует проверки: {instance.title}"
             
-        elif new_status == 'manager_approved':
-            # Notify students
-            recipients = User.objects.filter(
-                role='student',
-                is_active=True,
-                telegram_id__isnull=False
+        # Notify assigned carrier if status becomes assigned
+        if new_status == Cargo.CargoStatus.ASSIGNED and instance.assigned_to and instance.assigned_to.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.assigned_to.telegram_id,
+                telegram_service.format_cargo_notification(instance, "Вам назначен груз")
             )
-            action = f"Новый груз доступен: {instance.title}"
             
-        elif new_status == 'assigned':
-            # Notify carrier
-            if instance.assigned_to and instance.assigned_to.telegram_id:
-                recipients = [instance.assigned_to]
-                action = f"Вам назначен груз: {instance.title}"
+        # Notify managing student about status changes
+        if instance.managed_by and instance.managed_by.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.managed_by.telegram_id,
+                telegram_service.format_cargo_notification(instance, action)
+            )
+            
+        # Notify all students when cargo becomes manager_approved
+        if new_status == Cargo.CargoStatus.MANAGER_APPROVED:
+            students = User.objects.filter(role='student', is_active=True)
+            if students.exists():
+                for student in students:
+                    if student.telegram_id:
+                        telegram_service.send_notification.delay(
+                            student.telegram_id,
+                            telegram_service.format_cargo_notification(instance, "Новый груз доступен")
+                        )
 
-        # Send notifications via Telegram
-        if recipients and action:
-            messages = [
-                (user.telegram_id, telegram_service.format_cargo_notification(instance, action))
-                for user in recipients
-            ]
-            asyncio.create_task(telegram_service.send_bulk_messages(messages))
+@receiver(pre_save, sender=Cargo)
+def store_original_status(sender, instance, **kwargs):
+    """Store original status before save for comparison in post_save"""
+    if instance.pk:
+        try:
+            instance._original_status = Cargo.objects.get(pk=instance.pk).status
+        except Cargo.DoesNotExist:
+            instance._original_status = None
+    else:
+        instance._original_status = None
+
+@receiver(post_delete, sender=Cargo)
+def notify_cargo_deletion(sender, instance, **kwargs):
+    """Send notifications when cargo is deleted"""
+    action = f"Груз удален: {instance.title}"
+    
+    # Notify owner
+    if instance.owner and instance.owner.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.owner.telegram_id, 
+            telegram_service.format_cargo_notification(instance, action)
+        )
+    
+    # Notify carrier if assigned
+    if instance.assigned_to and instance.assigned_to.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.assigned_to.telegram_id,
+            telegram_service.format_cargo_notification(instance, action)
+        )
+    
+    # Notify managing student
+    if instance.managed_by and instance.managed_by.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.managed_by.telegram_id,
+            telegram_service.format_cargo_notification(instance, action)
+        )
 
 @receiver(post_save, sender=CarrierRequest)
-def notify_carrier_request_status_change(sender, instance, created, **kwargs):
-    """Send notifications for carrier request status changes"""
+def notify_carrier_request_changes(sender, instance, created, **kwargs):
+    """Send notifications for carrier request creation and changes"""
     if created:
-        return
+        action = "Новая заявка от перевозчика"
         
-    if instance.tracker.has_changed('status'):
-        old_status = instance.tracker.previous('status')
+        # Notify students about new carrier request
+        students = User.objects.filter(role='student', is_active=True)
+        if students.exists():
+            for student in students:
+                if student.telegram_id:
+                    telegram_service.send_notification.delay(
+                        student.telegram_id,
+                        telegram_service.format_carrier_notification(instance, action)
+                    )
+            
+    elif hasattr(instance, '_original_status') and instance._original_status != instance.status:
+        old_status = instance._original_status
         new_status = instance.status
         
-        recipients = []
-        action = ""
+        action = f"Статус заявки изменен с {old_status} на {new_status}"
         
-        if new_status == 'assigned':
-            if instance.carrier and instance.carrier.telegram_id:
-                recipients = [instance.carrier]
-                action = "Вашей заявке назначен груз"
+        # Notify carrier about status changes
+        if instance.carrier and instance.carrier.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.carrier.telegram_id,
+                telegram_service.format_carrier_notification(instance, action)
+            )
+            
+        # Notify assigning student if request was assigned
+        if instance.assigned_by and instance.assigned_by.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.assigned_by.telegram_id,
+                telegram_service.format_carrier_notification(instance, action)
+            )
                 
-        elif new_status in ['accepted', 'rejected']:
-            if instance.assigned_by and instance.assigned_by.telegram_id:
-                recipients = [instance.assigned_by]
-                action = f"Перевозчик {'принял' if new_status == 'accepted' else 'отклонил'} назначенный груз"
+        # Notify cargo owner if request was accepted
+        if new_status == CarrierRequest.RequestStatus.ACCEPTED and instance.assigned_cargo and instance.assigned_cargo.owner and instance.assigned_cargo.owner.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.assigned_cargo.owner.telegram_id,
+                telegram_service.format_carrier_notification(instance, "Перевозчик принял вашу заявку")
+            )
 
-        # Send notifications via Telegram
-        if recipients and action:
-            messages = [
-                (user.telegram_id, telegram_service.format_carrier_notification(instance, action))
-                for user in recipients
-            ]
-            asyncio.create_task(telegram_service.send_bulk_messages(messages))
+@receiver(pre_save, sender=CarrierRequest)
+def store_carrier_request_original_status(sender, instance, **kwargs):
+    """Store original status before save for comparison in post_save"""
+    if instance.pk:
+        try:
+            instance._original_status = CarrierRequest.objects.get(pk=instance.pk).status
+        except CarrierRequest.DoesNotExist:
+            instance._original_status = None
+    else:
+        instance._original_status = None
+
+@receiver(post_delete, sender=CarrierRequest)
+def notify_carrier_request_deletion(sender, instance, **kwargs):
+    """Send notifications when carrier request is deleted"""
+    action = f"Заявка перевозчика удалена"
+    
+    # Notify carrier
+    if instance.carrier and instance.carrier.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.carrier.telegram_id,
+            telegram_service.format_carrier_notification(instance, action)
+        )
+    
+    # Notify assigning student
+    if instance.assigned_by and instance.assigned_by.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.assigned_by.telegram_id,
+            telegram_service.format_carrier_notification(instance, action)
+        )
+    
+    # Notify cargo owner if request was assigned to a cargo
+    if instance.assigned_cargo and instance.assigned_cargo.owner and instance.assigned_cargo.owner.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.assigned_cargo.owner.telegram_id,
+            telegram_service.format_carrier_notification(instance, action)
+        )
 ```
 
 # cargo\urls.py
@@ -1488,12 +1945,14 @@ urlpatterns = [
 # cargo\views.py
 
 ```py
+from decimal import Decimal
 from rest_framework import viewsets, status, permissions, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 
 from users.models import User
@@ -1522,6 +1981,10 @@ from core.permissions import (
     IsLogisticsCompany,
     IsCargoOwner
 )
+import hashlib
+from drf_spectacular.types import OpenApiTypes
+from django.conf import settings
+from rest_framework.permissions import AllowAny
 
 class ManagerCargoViewSet(viewsets.ModelViewSet):
     """ViewSet for manager operations on cargo"""
@@ -1614,43 +2077,79 @@ class ManagerCargoViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
     
 class ExternalCargoViewSet(viewsets.GenericViewSet):
-    """ViewSet for external cargo creation"""
-    permission_classes = [permissions.AllowAny]
-    serializer_class = ExternalCargoCreateSerializer
+    """ViewSet for external cargo creation via API"""
+    permission_classes = [AllowAny]
+    # serializer_class = CargoSerializer
 
     @action(detail=False, methods=['post'])
     def create_external(self, request):
         """
-        Create a cargo from external source (Telegram/API)
-        Requires valid API key for authentication
+        Create cargo entries from external API
+        Requires authentication with API key and hash verification
         """
-        serializer = self.get_serializer(data=request.data)
-        
         try:
-            serializer.is_valid(raise_exception=True)
+            # Extract data from request
+            api_key = request.data.get('api_key')
+            created_at = request.data.get('created_at')
+            received_hash = request.data.get('hash')
+            orders = request.data.get('orders', [])
+
+            # Check for required fields
+            if not all([api_key, created_at, received_hash, orders]):
+                return Response(
+                    {'error': 'Missing required fields'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+            # Verify hash
+            private_key = settings.PRIVATE_API_KEY
+            calculated_hash = hashlib.md5(
+                (private_key + api_key + str(created_at)).encode()
+            ).hexdigest()
             
-            # Get or create system user for external cargos
-            system_user, _ = User.objects.get_or_create(
-                username='system',
-                defaults={
-                    'first_name': 'System',
-                    'is_active': True,
-                    'is_verified': True,
-                    'role': 'logistics-company'
-                }
-            )
+            if calculated_hash != received_hash:
+                return Response(
+                    {'error': 'Invalid authentication'},
+                    status=status.HTTP_401_UNAUTHORIZED
+                )
             
-            # Create cargo with system user as owner
-            cargo = Cargo.objects.create(
-                owner=system_user,
-                **serializer.validated_data
-            )
+            created_cargos = []
+            errors = []
+            
+            # Process each order
+            for order_data in orders:
+                try:
+                    # Convert string numeric values to proper types
+                    cleaned_data = self._convert_data_types(order_data)
+                    
+                    # Set source type to external API if not provided
+                    if 'source_type' not in cleaned_data:
+                        cleaned_data['source_type'] = 'api'
+                    
+                    cargo = Cargo.objects.create(
+                        status='pending',  # Use string to match choices
+                        **cleaned_data
+                    )
+                    
+                    created_cargos.append({
+                        'id': cargo.id,
+                        'title': cargo.title,
+                        'source_id': cargo.source_id
+                    })
+                    
+                except Exception as e:
+                    errors.append({
+                        'order': order_data.get('source_id', 'Unknown'),
+                        'error': str(e)
+                    })
             
             return Response(
                 {
-                    'id': cargo.id,
                     'status': 'success',
-                    'message': 'Cargo created successfully'
+                    'created': len(created_cargos),
+                    'errors': len(errors),
+                    'cargos': created_cargos,
+                    'error_details': errors
                 },
                 status=status.HTTP_201_CREATED
             )
@@ -1663,6 +2162,26 @@ class ExternalCargoViewSet(viewsets.GenericViewSet):
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+    def _convert_data_types(self, data):
+        """Convert string values to appropriate data types"""
+        result = {}
+        for key, value in data.items():
+            if key in ['weight', 'volume', 'length', 'width', 'height', 'price'] and value:
+                try:
+                    result[key] = Decimal(str(value))
+                except (ValueError, TypeError):
+                    result[key] = None
+            elif key == 'loading_date' and value:
+                try:
+                    result[key] = parse_date(str(value))
+                except (ValueError, TypeError):
+                    result[key] = None
+            elif key in ['is_constant', 'is_ready']:
+                result[key] = bool(value)
+            else:
+                result[key] = value
+        return result
         
 class CarrierRequestViewSet(viewsets.ModelViewSet):
     """ViewSet for carrier requests"""
@@ -2117,8 +2636,42 @@ from .models import (
     Rating,
     TelegramGroup,
     TelegramMessage,
-    SearchFilter
+    SearchFilter,
+    Location
 )
+
+
+
+@admin.register(Location)
+class LocationAdmin(admin.ModelAdmin):
+    list_display = (
+        'name', 'level', 'latitude',
+        'longitude', 'code', 'created_at'
+    )
+    list_filter = ('level', 'created_at')
+    search_fields = ('name', 'code')
+    ordering = ('name',)
+    raw_id_fields = ('parent', 'country')
+    readonly_fields = ('created_at', 'updated_at')
+    fieldsets = (
+        (None, {
+            'fields': (
+                'name', 'level', 'latitude',
+                'longitude', 'code', 'additional_data'
+            )
+        }),
+        (_('Hierarchy'), {
+            'fields': ('parent', 'country'),
+            'classes': ('collapse',)
+        }),
+        (_('Timestamps'), {
+            'fields': ('created_at', 'updated_at'),
+            'classes': ('collapse',)
+        })
+    )
+
+
+
 
 @admin.register(Notification)
 class NotificationAdmin(admin.ModelAdmin):
@@ -2235,11 +2788,706 @@ class SearchFilterAdmin(admin.ModelAdmin):
 ```py
 from django.apps import AppConfig
 
-
 class CoreConfig(AppConfig):
     default_auto_field = 'django.db.models.BigAutoField'
     name = 'core'
+    
+    def ready(self):
+        import core.signals  # Import signals when app is ready
+```
 
+# core\cache.py
+
+```py
+from django.core.cache import cache
+from django.conf import settings
+from .models import Location
+
+CACHE_TTL = getattr(settings, 'LOCATION_CACHE_TTL', 60 * 60 * 24)  # 24 hours
+
+def get_cached_countries():
+    """Get list of countries from cache or database"""
+    key = 'location_countries'
+    countries = cache.get(key)
+    
+    if countries is None:
+        countries = list(Location.objects.filter(level=1).values(
+            'id', 'name', 'code', 'additional_data'
+        ))
+        cache.set(key, countries, CACHE_TTL)
+    
+    return countries
+
+def get_cached_states(country_id):
+    """Get states for a country from cache or database"""
+    key = f'location_states_{country_id}'
+    states = cache.get(key)
+    
+    if states is None:
+        states = list(Location.objects.filter(
+            level=2,
+            country_id=country_id
+        ).values('id', 'name', 'code', 'additional_data'))
+        cache.set(key, states, CACHE_TTL)
+    
+    return states
+
+def get_cached_cities(parent_id, is_state=True):
+    """Get cities for a state or country from cache or database"""
+    key = f'location_cities_{parent_id}'
+    cities = cache.get(key)
+    
+    if cities is None:
+        filter_kwargs = {
+            'level': 3,
+            'parent_id' if is_state else 'country_id': parent_id
+        }
+        cities = list(Location.objects.filter(**filter_kwargs).values(
+            'id', 'name', 'latitude', 'longitude'
+        ))
+        cache.set(key, cities, CACHE_TTL)
+    
+    return cities
+
+def invalidate_location_cache(location_id=None):
+    """Invalidate location caches"""
+    if location_id:
+        location = Location.objects.get(id=location_id)
+        if location.level == 1:  # Country
+            cache.delete('location_countries')
+            cache.delete(f'location_states_{location_id}')
+            cache.delete(f'location_cities_{location_id}')
+        elif location.level == 2:  # State
+            cache.delete(f'location_states_{location.country_id}')
+            cache.delete(f'location_cities_{location_id}')
+        else:  # City
+            cache.delete(f'location_cities_{location.parent_id}')
+    else:
+        # Invalidate all location caches
+        cache.delete_pattern('location_*')
+```
+
+# core\handlers.py
+
+```py
+from django.db.models.signals import post_save, post_delete
+from django.dispatch import receiver
+from cargo.models import Cargo, CarrierRequest
+from users.models import User
+from core.services.telegram import telegram_service
+
+@receiver(post_save, sender=Cargo)
+def handle_cargo_notification(sender, instance, created, **kwargs):
+    """Handle cargo notifications"""
+    if created:
+        action = "Новый груз создан"
+    else:
+        if not instance.tracker.has_changed('status'):
+            return
+        action = f"Статус груза изменен на {instance.get_status_display()}"
+
+    # Determine recipients based on status and role
+    recipients = []
+    
+    if instance.status == 'pending_approval':
+        # Notify managers about new cargo
+        recipients = User.objects.filter(role='manager', is_active=True)
+    elif instance.status == 'manager_approved':
+        # Notify students about approved cargo
+        recipients = User.objects.filter(role='student', is_active=True)
+    elif instance.status == 'assigned':
+        # Notify assigned carrier
+        if instance.assigned_to:
+            recipients = [instance.assigned_to]
+    
+    # Send notifications
+    notifications = [
+        {
+            'telegram_id': user.telegram_id,
+            'message': telegram_service.format_cargo_message(action, instance)
+        }
+        for user in recipients if user.telegram_id
+    ]
+    
+    if notifications:
+        telegram_service.send_bulk_notifications.delay(notifications)
+
+@receiver(post_save, sender=CarrierRequest)
+def handle_carrier_request_notification(sender, instance, created, **kwargs):
+    """Handle carrier request notifications"""
+    if created:
+        action = "Новая заявка от перевозчика"
+    else:
+        if not instance.tracker.has_changed('status'):
+            return
+        action = f"Статус заявки изменен на {instance.get_status_display()}"
+
+    # Determine recipients
+    recipients = []
+    
+    if instance.status == 'pending':
+        # Notify students about new request
+        recipients = User.objects.filter(role='student', is_active=True)
+    elif instance.status == 'assigned':
+        # Notify carrier about assignment
+        recipients = [instance.carrier]
+    elif instance.status in ['accepted', 'rejected']:
+        # Notify assigning student
+        if instance.assigned_by:
+            recipients = [instance.assigned_by]
+
+    # Send notifications
+    notifications = [
+        {
+            'telegram_id': user.telegram_id,
+            'message': telegram_service.format_carrier_request_message(action, instance)
+        }
+        for user in recipients if user.telegram_id
+    ]
+    
+    if notifications:
+        telegram_service.send_bulk_notifications.delay(notifications)
+
+@receiver(post_delete, sender=Cargo)
+def handle_cargo_deletion(sender, instance, **kwargs):
+    """Handle cargo deletion notifications"""
+    # Notify cargo owner
+    if instance.owner and instance.owner.telegram_id:
+        message = f"""
+❌ <b>Груз удален</b>
+
+<b>Груз:</b> {instance.title}
+<b>Маршрут:</b> {instance.loading_point} ➡️ {instance.unloading_point}
+"""
+        telegram_service.send_notification.delay(
+            instance.owner.telegram_id,
+            message
+        )
+```
+
+# core\management\commands\import_locations.py
+
+```py
+import os
+import re
+import psycopg2
+import logging
+from django.core.management.base import BaseCommand, CommandError
+from django.conf import settings
+from django.db import transaction, connection
+from core.models import Location
+
+# Настройка логгера
+logger = logging.getLogger(__name__)
+
+class Command(BaseCommand):
+    help = 'Import locations from world.sql into Location model'
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--file',
+            type=str,
+            help='Path to world.sql file',
+            default='world.sql'
+        )
+        parser.add_argument(
+            '--batch-size',
+            type=int, 
+            help='Batch size for inserting data', 
+            default=1000
+        )
+        parser.add_argument(
+            '--countries-only',
+            action='store_true',
+            help='Import only countries'
+        )
+        parser.add_argument(
+            '--states-only',
+            action='store_true',
+            help='Import only states'
+        )
+        parser.add_argument(
+            '--cities-only',
+            action='store_true',
+            help='Import only cities'
+        )
+        parser.add_argument(
+            '--skip-existing',
+            action='store_true',
+            help='Skip import if data already exists'
+        )
+
+    def handle(self, *args, **options):
+        file_path = options['file']
+        batch_size = options['batch_size']
+        countries_only = options['countries_only']
+        states_only = options['states_only']
+        cities_only = options['cities_only']
+        skip_existing = options['skip_existing']
+        
+        if not os.path.exists(file_path):
+            raise CommandError(f'File {file_path} does not exist')
+
+        # Проверка наличия данных
+        if skip_existing and Location.objects.exists():
+            self.stdout.write('Locations already exist, skipping import.')
+            return
+
+        self.stdout.write('Starting import...')
+        
+        conn = None
+        try:
+            conn = psycopg2.connect(
+                dbname=settings.DATABASES['default']['NAME'],
+                user=settings.DATABASES['default']['USER'],
+                password=settings.DATABASES['default']['PASSWORD'],
+                host=settings.DATABASES['default']['HOST'],
+                port=settings.DATABASES['default']['PORT'],
+            )
+            
+            conn.autocommit = False  # Отключаем автоматические транзакции
+            cursor = conn.cursor()
+            
+            # Импорт стран
+            if not states_only and not cities_only:
+                self._import_countries(cursor, file_path, batch_size)
+                conn.commit()
+                
+            # Импорт штатов/регионов
+            if not countries_only and not cities_only:
+                self._import_states(cursor, file_path, batch_size)
+                conn.commit()
+                
+            # Импорт городов
+            if not countries_only and not states_only:
+                self._import_cities(cursor, file_path, batch_size)
+                conn.commit()
+                
+            self.stdout.write(self.style.SUCCESS('Successfully imported locations'))
+
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            self.stdout.write(self.style.ERROR(f'Import failed: {str(e)}'))
+            logger.exception("Import failed")
+            raise CommandError(f'Import failed: {str(e)}')
+        
+        finally:
+            if conn:
+                conn.close()
+
+    def _import_countries(self, cursor, file_path, batch_size):
+        """Import countries from SQL file"""
+        self.stdout.write('Importing countries...')
+        
+        try:
+            # Создаем временную таблицу с ПРАВИЛЬНЫМ типом для iso2 - varchar вместо char
+            cursor.execute("""
+                DROP TABLE IF EXISTS temp_countries;
+                CREATE TEMP TABLE temp_countries (
+                    id bigint PRIMARY KEY,
+                    name varchar(100) NOT NULL,
+                    iso2 varchar(10),  -- Изменено с char(2) на varchar(10)
+                    latitude numeric(10,8),
+                    longitude numeric(11,8),
+                    capital varchar(255),
+                    currency_name varchar(255),
+                    region varchar(255),
+                    created_at timestamp,
+                    updated_at timestamp
+                )
+            """)
+            
+            # Читаем и извлекаем данные о странах
+            country_data = self._extract_data_from_sql(file_path, 'countries')
+            
+            # Вставляем данные пакетами
+            for i in range(0, len(country_data), batch_size):
+                batch = country_data[i:i+batch_size]
+                self._insert_countries(cursor, batch)
+                self.stdout.write(f"Inserted countries batch {i//batch_size + 1}, {len(batch)} rows")
+            
+            # Копируем данные из временной таблицы в Location
+            cursor.execute("""
+                INSERT INTO core_location (id, name, level, code, latitude, longitude, additional_data, created_at, updated_at)
+                SELECT 
+                    id, 
+                    name, 
+                    1 as level, 
+                    SUBSTRING(iso2, 1, 10) as code,  -- Убедимся, что код не превышает 10 символов
+                    latitude, 
+                    longitude, 
+                    json_build_object('capital', capital, 'currency', currency_name, 'region', region),
+                    COALESCE(created_at, NOW()),
+                    COALESCE(updated_at, NOW())
+                FROM temp_countries
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id
+            """)
+            
+            inserted = cursor.rowcount
+            self.stdout.write(f"Imported {inserted} countries")
+            
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"Error importing countries: {str(e)}"))
+            logger.exception("Error importing countries")
+            raise
+
+    def _import_states(self, cursor, file_path, batch_size):
+        """Import states/regions from SQL file"""
+        self.stdout.write('Importing states/regions...')
+        
+        try:
+            # Создаем временную таблицу
+            cursor.execute("""
+                DROP TABLE IF EXISTS temp_states;
+                CREATE TEMP TABLE temp_states (
+                    id bigint PRIMARY KEY,
+                    name varchar(255) NOT NULL,
+                    country_id bigint NOT NULL,
+                    state_code varchar(255),
+                    latitude numeric(10,8),
+                    longitude numeric(11,8),
+                    type varchar(191),
+                    created_at timestamp,
+                    updated_at timestamp
+                )
+            """)
+            
+            # Читаем и извлекаем данные о штатах
+            state_data = self._extract_data_from_sql(file_path, 'states')
+            
+            # Вставляем данные пакетами
+            total_inserted = 0
+            for i in range(0, len(state_data), batch_size):
+                try:
+                    batch = state_data[i:i+batch_size]
+                    inserted = self._insert_states(cursor, batch)
+                    total_inserted += inserted
+                    self.stdout.write(f"Inserted states batch {i//batch_size + 1}, {inserted} rows")
+                except Exception as e:
+                    self.stdout.write(self.style.WARNING(f"Error in states batch {i//batch_size + 1}: {str(e)}"))
+                    # Продолжаем со следующего пакета
+                    cursor.execute("ROLLBACK")
+            
+            # Копируем данные из временной таблицы в Location
+            cursor.execute("""
+                INSERT INTO core_location (id, name, parent_id, country_id, level, code, latitude, longitude, additional_data, created_at, updated_at)
+                SELECT 
+                    s.id, 
+                    s.name, 
+                    s.country_id as parent_id, 
+                    s.country_id as country_id, 
+                    2 as level, 
+                    s.state_code as code, 
+                    s.latitude, 
+                    s.longitude, 
+                    json_build_object('type', s.type),
+                    COALESCE(s.created_at, NOW()),
+                    COALESCE(s.updated_at, NOW())
+                FROM temp_states s
+                JOIN core_location c ON s.country_id = c.id
+                WHERE c.level = 1
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id
+            """)
+            
+            inserted = cursor.rowcount
+            self.stdout.write(f"Imported {inserted} states/regions")
+            
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"Error importing states: {str(e)}"))
+            logger.exception("Error importing states")
+            raise
+
+    def _import_cities(self, cursor, file_path, batch_size):
+        """Import cities from SQL file"""
+        self.stdout.write('Importing cities...')
+        
+        try:
+            # Создаем временную таблицу
+            cursor.execute("""
+                DROP TABLE IF EXISTS temp_cities;
+                CREATE TEMP TABLE temp_cities (
+                    id bigint PRIMARY KEY,
+                    name varchar(255) NOT NULL,
+                    state_id bigint,
+                    country_id bigint NOT NULL,
+                    latitude numeric(10,8),
+                    longitude numeric(11,8),
+                    created_at timestamp,
+                    updated_at timestamp
+                )
+            """)
+            
+            # Читаем и извлекаем данные о городах
+            city_data = self._extract_data_from_sql(file_path, 'cities')
+            
+            # Вставляем данные пакетами
+            total_inserted = 0
+            for i in range(0, len(city_data), batch_size):
+                try:
+                    batch = city_data[i:i+batch_size]
+                    inserted = self._insert_cities(cursor, batch)
+                    total_inserted += inserted
+                    self.stdout.write(f"Inserted cities batch {i//batch_size + 1}, {inserted} rows")
+                except Exception as e:
+                    self.stdout.write(self.style.WARNING(f"Error in cities batch {i//batch_size + 1}: {str(e)}"))
+                    # Продолжаем со следующего пакета
+                    cursor.execute("ROLLBACK")
+            
+            # Импорт городов с привязкой к штатам
+            cursor.execute("""
+                INSERT INTO core_location (name, parent_id, country_id, level, latitude, longitude, created_at, updated_at)
+                SELECT 
+                    c.name, 
+                    c.state_id as parent_id, 
+                    c.country_id, 
+                    3 as level,
+                    c.latitude, 
+                    c.longitude, 
+                    COALESCE(c.created_at, NOW()),
+                    COALESCE(c.updated_at, NOW())
+                FROM temp_cities c
+                JOIN core_location s ON c.state_id = s.id
+                WHERE s.level = 2
+                ON CONFLICT DO NOTHING
+                RETURNING id
+            """)
+            
+            inserted_with_state = cursor.rowcount
+            self.stdout.write(f"Imported {inserted_with_state} cities with state reference")
+            
+            # Импорт городов без штатов, напрямую к странам
+            cursor.execute("""
+                INSERT INTO core_location (name, parent_id, country_id, level, latitude, longitude, created_at, updated_at)
+                SELECT 
+                    c.name, 
+                    c.country_id as parent_id, 
+                    c.country_id, 
+                    3 as level,
+                    c.latitude, 
+                    c.longitude, 
+                    COALESCE(c.created_at, NOW()),
+                    COALESCE(c.updated_at, NOW())
+                FROM temp_cities c
+                LEFT JOIN core_location s ON c.state_id = s.id
+                WHERE s.id IS NULL AND c.state_id IS NULL
+                ON CONFLICT DO NOTHING
+                RETURNING id
+            """)
+            
+            inserted_without_state = cursor.rowcount
+            self.stdout.write(f"Imported {inserted_without_state} cities without state reference")
+            
+            total_cities = inserted_with_state + inserted_without_state
+            self.stdout.write(f"Total imported cities: {total_cities}")
+            
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"Error importing cities: {str(e)}"))
+            logger.exception("Error importing cities")
+            raise
+
+    def _extract_data_from_sql(self, file_path, table_name):
+        """Extract data from SQL file for the specified table"""
+        result = []
+        pattern = r"INSERT INTO public\.{}\s+VALUES\s*\((.*?)\);".format(table_name)
+        
+        # Чтение файла построчно с объединением строк
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            # Находим все вставки для указанной таблицы
+            matches = re.findall(pattern, content, re.DOTALL | re.MULTILINE)
+            
+            for match in matches:
+                # Разделяем несколько значений INSERT
+                values = match.split('), (')
+                for value in values:
+                    # Очищаем значение
+                    value = value.strip()
+                    if not value.startswith('('):
+                        value = '(' + value
+                    if not value.endswith(')'):
+                        value = value + ')'
+                    result.append(value)
+        
+        self.stdout.write(f"Extracted {len(result)} {table_name} from SQL file")
+        return result
+
+    def _insert_countries(self, cursor, countries_batch):
+        """Insert batch of countries into temp table"""
+        if not countries_batch:
+            return 0
+            
+        values = []
+        for country in countries_batch:
+            # Преобразуем строку значений в кортеж
+            try:
+                # Примерная позиция нужных нам полей:
+                # 0=id, 1=name, 4=iso2, 19=latitude, 20=longitude, 6=capital, 8=currency_name, 12=region, 23=created_at, 24=updated_at
+                # Извлекаем из строки "VALUES (1, 'name', ...)"
+                fields = self._split_sql_values(country)
+                
+                # Проверяем минимальное количество полей
+                if len(fields) < 21:
+                    continue
+                
+                country_values = [
+                    fields[0],  # id
+                    fields[1],  # name
+                    fields[4] if fields[4] != 'NULL' else None,  # iso2
+                    fields[19] if fields[19] != 'NULL' else None,  # latitude
+                    fields[20] if fields[20] != 'NULL' else None,  # longitude
+                    fields[6] if fields[6] != 'NULL' else None,  # capital
+                    fields[8] if fields[8] != 'NULL' else None,  # currency_name
+                    fields[12] if fields[12] != 'NULL' else None,  # region
+                    fields[23] if len(fields) > 23 and fields[23] != 'NULL' else None,  # created_at
+                    fields[24] if len(fields) > 24 and fields[24] != 'NULL' else None  # updated_at
+                ]
+                
+                values.append(cursor.mogrify("(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", country_values).decode('utf-8'))
+            except Exception as e:
+                self.stdout.write(self.style.WARNING(f"Error processing country: {str(e)}"))
+        
+        if not values:
+            return 0
+            
+        # Вставляем все значения одним запросом
+        query = """
+            INSERT INTO temp_countries 
+            (id, name, iso2, latitude, longitude, capital, currency_name, region, created_at, updated_at)
+            VALUES {} 
+            ON CONFLICT (id) DO NOTHING
+        """.format(','.join(values))
+        
+        cursor.execute(query)
+        return cursor.rowcount
+
+    def _insert_states(self, cursor, states_batch):
+        """Insert batch of states into temp table"""
+        if not states_batch:
+            return 0
+            
+        values = []
+        for state in states_batch:
+            try:
+                # Примерная позиция нужных нам полей:
+                # 0=id, 1=name, 2=country_id, 4=state_code, 7=latitude, 8=longitude, 6=type, 9=created_at, 10=updated_at
+                fields = self._split_sql_values(state)
+                
+                # Проверяем минимальное количество полей
+                if len(fields) < 9:
+                    continue
+                
+                state_values = [
+                    fields[0],  # id
+                    fields[1],  # name
+                    fields[2],  # country_id
+                    fields[4] if fields[4] != 'NULL' else None,  # state_code
+                    fields[7] if fields[7] != 'NULL' else None,  # latitude
+                    fields[8] if fields[8] != 'NULL' else None,  # longitude
+                    fields[6] if fields[6] != 'NULL' else None,  # type
+                    fields[9] if len(fields) > 9 and fields[9] != 'NULL' else None,  # created_at
+                    fields[10] if len(fields) > 10 and fields[10] != 'NULL' else None  # updated_at
+                ]
+                
+                values.append(cursor.mogrify("(%s,%s,%s,%s,%s,%s,%s,%s,%s)", state_values).decode('utf-8'))
+            except Exception as e:
+                self.stdout.write(self.style.WARNING(f"Error processing state: {str(e)}"))
+        
+        if not values:
+            return 0
+            
+        # Вставляем все значения одним запросом
+        query = """
+            INSERT INTO temp_states 
+            (id, name, country_id, state_code, latitude, longitude, type, created_at, updated_at)
+            VALUES {} 
+            ON CONFLICT (id) DO NOTHING
+        """.format(','.join(values))
+        
+        cursor.execute(query)
+        return cursor.rowcount
+
+    def _insert_cities(self, cursor, cities_batch):
+        """Insert batch of cities into temp table"""
+        if not cities_batch:
+            return 0
+            
+        values = []
+        for city in cities_batch:
+            try:
+                # Примерная позиция нужных нам полей:
+                # 0=id, 1=name, 2=state_id, 4=country_id, 6=latitude, 7=longitude, 8=created_at, 9=updated_at
+                fields = self._split_sql_values(city)
+                
+                # Проверяем минимальное количество полей
+                if len(fields) < 8:
+                    continue
+                
+                city_values = [
+                    fields[0],  # id
+                    fields[1],  # name
+                    fields[2] if fields[2] != 'NULL' else None,  # state_id
+                    fields[4],  # country_id
+                    fields[6] if fields[6] != 'NULL' else None,  # latitude
+                    fields[7] if fields[7] != 'NULL' else None,  # longitude
+                    fields[8] if len(fields) > 8 and fields[8] != 'NULL' else None,  # created_at
+                    fields[9] if len(fields) > 9 and fields[9] != 'NULL' else None,  # updated_at
+                ]
+                
+                values.append(cursor.mogrify("(%s,%s,%s,%s,%s,%s,%s,%s)", city_values).decode('utf-8'))
+            except Exception as e:
+                self.stdout.write(self.style.WARNING(f"Error processing city: {str(e)}"))
+        
+        if not values:
+            return 0
+            
+        # Вставляем все значения одним запросом
+        query = """
+            INSERT INTO temp_cities 
+            (id, name, state_id, country_id, latitude, longitude, created_at, updated_at)
+            VALUES {} 
+            ON CONFLICT (id) DO NOTHING
+        """.format(','.join(values))
+        
+        cursor.execute(query)
+        return cursor.rowcount
+
+    def _split_sql_values(self, values_line):
+        """
+        Split SQL values line respecting quotes and nested parentheses
+        Example: "1, 'text with, comma', NULL, (1,2,3)"
+        """
+        result = []
+        current_value = ""
+        in_quotes = False
+        paren_level = 0
+        
+        # Удаляем внешние скобки
+        values_line = values_line.strip('()')
+        
+        for char in values_line:
+            if char == "'" and (len(current_value) == 0 or current_value[-1] != '\\'):
+                in_quotes = not in_quotes
+                current_value += char
+            elif char == '(' and not in_quotes:
+                paren_level += 1
+                current_value += char
+            elif char == ')' and not in_quotes:
+                paren_level -= 1
+                current_value += char
+            elif char == ',' and not in_quotes and paren_level == 0:
+                result.append(current_value.strip())
+                current_value = ""
+            else:
+                current_value += char
+                
+        # Добавляем последнее значение
+        if current_value:
+            result.append(current_value.strip())
+            
+        return result
 ```
 
 # core\models.py
@@ -2250,7 +3498,76 @@ from django.utils.translation import gettext_lazy as _
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from users.models import User
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+import logging
+from cargo.models import Cargo
+logger = logging.getLogger(__name__)
 
+class Location(models.Model):
+    """
+    Unified model for countries, states and cities
+    Level: 1 = Country, 2 = State/Region, 3 = City
+    """
+    name = models.CharField(max_length=255)
+    parent = models.ForeignKey('self', on_delete=models.CASCADE, null=True, blank=True)
+    country = models.ForeignKey('self', on_delete=models.CASCADE, null=True, blank=True, 
+                               related_name='all_locations')
+    level = models.SmallIntegerField(
+        choices=[
+            (1, 'Country'),
+            (2, 'State/Region'),
+            (3, 'City')
+        ]
+    )
+    latitude = models.DecimalField(max_digits=10, decimal_places=8, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=11, decimal_places=8, null=True, blank=True)
+    code = models.CharField(max_length=10, null=True, blank=True)  # Для кодов стран/штатов (iso2, state_code и т.д.)
+    additional_data = models.JSONField(null=True, blank=True)  # Для хранения дополнительных данных
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['level']),
+            models.Index(fields=['parent_id']),
+            models.Index(fields=['country_id']),
+            # Индекс для географического поиска
+            models.Index(fields=['latitude', 'longitude'], name='location_coords_idx')
+        ]
+        ordering = ['name']
+
+    def __str__(self):
+        if self.level == 1:
+            return f"{self.name} (Country)"
+        elif self.level == 2:
+            return f"{self.name}, {self.country.name} (State)" if self.country else f"{self.name} (State)"
+        else:
+            state = self.parent.name if self.parent and self.parent.level == 2 else None
+            country_name = self.country.name if self.country else ""
+            return f"{self.name}, {state + ', ' if state else ''}{country_name} (City)"
+
+    def get_hierarchy(self):
+        """Returns list of parent locations up to country"""
+        hierarchy = []
+        current = self
+        while current:
+            hierarchy.append({
+                'id': current.id,
+                'name': current.name,
+                'level': current.level
+            })
+            current = current.parent
+        return list(reversed(hierarchy))
+
+    @property
+    def full_name(self):
+        """Returns full location name including parent locations"""
+        hierarchy = self.get_hierarchy()
+        return ' › '.join(item['name'] for item in hierarchy)
+    
+    
 class Notification(models.Model):
     class NotificationType(models.TextChoices):
         CARGO = 'cargo', _('Cargo')
@@ -2375,6 +3692,101 @@ class SearchFilter(models.Model):
         
     def __str__(self):
         return f"{self.user.username} - {self.name}"
+    
+
+@receiver(post_save, sender=SearchFilter)
+def notify_search_filter_subscription(sender, instance, created, **kwargs):
+    """Send notification when a user subscribes to a search filter"""
+    if created and instance.notifications_enabled:
+        # Prepare notification message
+        message = f"""
+📢 <b>Новая подписка на фильтр</b>
+
+Вы подписались на уведомления по фильтру "{instance.name}".
+Вы будете получать уведомления о новых грузах, соответствующих вашим критериям.
+
+👉 Перейдите в приложение для управления подписками
+"""
+        
+        # Notify user
+        from core.services.telegram import telegram_service
+        if instance.user.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.user.telegram_id,
+                message
+            )
+
+def cargo_matches_filter(cargo, filter_data):
+    """Check if cargo matches filter criteria"""
+    # Basic matching logic - can be expanded for more complex filters
+    matches = True
+    
+    # Match vehicle type
+    if filter_data.get('vehicle_type') and cargo.vehicle_type != filter_data['vehicle_type']:
+        matches = False
+        
+    # Match loading point
+    if filter_data.get('loading_point'):
+        if filter_data['loading_point'].lower() not in cargo.loading_point.lower():
+            matches = False
+            
+    # Match unloading point
+    if filter_data.get('unloading_point'):
+        if filter_data['unloading_point'].lower() not in cargo.unloading_point.lower():
+            matches = False
+    
+    # Match date range
+    if filter_data.get('date_from'):
+        from django.utils.dateparse import parse_date
+        date_from = parse_date(filter_data['date_from'])
+        if date_from and cargo.loading_date < date_from:
+            matches = False
+            
+    if filter_data.get('date_to'):
+        from django.utils.dateparse import parse_date
+        date_to = parse_date(filter_data['date_to'])
+        if date_to and cargo.loading_date > date_to:
+            matches = False
+    
+    return matches
+
+@receiver(post_save, sender=Cargo)
+def notify_matching_filter_subscribers(sender, instance, created, **kwargs):
+    """Notify users with matching search filters about new cargo"""
+    if not created:
+        return
+        
+    from core.services.telegram import telegram_service
+    
+    # Find all active search filters with notifications enabled
+    search_filters = SearchFilter.objects.filter(notifications_enabled=True)
+    
+    for filter_obj in search_filters:
+        try:
+            # Check if cargo matches filter criteria
+            if cargo_matches_filter(instance, filter_obj.filter_data):
+                # Create notification message
+                message = f"""
+🚛 <b>Новый груз по вашему фильтру</b>
+
+<b>Фильтр:</b> {filter_obj.name}
+<b>Груз:</b> {instance.title}
+<b>Маршрут:</b> {instance.loading_point} ➡️ {instance.unloading_point}
+<b>Дата загрузки:</b> {instance.loading_date.strftime('%d.%m.%Y')}
+
+👉 Перейдите в приложение для подробностей
+"""
+                
+                # Send notification
+                if filter_obj.user.telegram_id:
+                    telegram_service.send_notification.delay(
+                        filter_obj.user.telegram_id,
+                        message
+                    )
+        except Exception as e:
+            # Log the error but continue processing other filters
+            logger.error(f"Error processing filter {filter_obj.id}: {str(e)}")
+            continue
 ```
 
 # core\permissions.py
@@ -2494,10 +3906,48 @@ from rest_framework import serializers
 from django.contrib.contenttypes.models import ContentType
 from .models import (
     Notification, Favorite, Rating, TelegramGroup,
-    TelegramMessage, SearchFilter
+    TelegramMessage, SearchFilter, Location
 )
 from users.serializers import UserProfileSerializer
 
+class LocationListSerializer(serializers.ModelSerializer):
+    """Simple serializer for location lists"""
+    class Meta:
+        model = Location
+        fields = ['id', 'name', 'level', 'code']
+
+class LocationDetailSerializer(serializers.ModelSerializer):
+    """Detailed serializer with hierarchy information"""
+    parent_name = serializers.CharField(source='parent.name', read_only=True)
+    country_name = serializers.CharField(source='country.name', read_only=True)
+    hierarchy = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Location
+        fields = [
+            'id', 'name', 'level', 'code',
+            'parent_name', 'country_name',
+            'latitude', 'longitude',
+            'hierarchy', 'additional_data'
+        ]
+    
+    def get_hierarchy(self, obj):
+        return obj.get_hierarchy()
+
+class LocationSearchSerializer(serializers.ModelSerializer):
+    """Serializer for location search results"""
+    distance = serializers.FloatField(read_only=True)
+    full_name = serializers.CharField(read_only=True)
+    
+    class Meta:
+        model = Location
+        fields = [
+            'id', 'name', 'level',
+            'latitude', 'longitude',
+            'distance', 'full_name'
+        ]
+
+# Остальные существующие сериализаторы
 class NotificationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Notification
@@ -2605,137 +4055,258 @@ class SearchFilterUpdateSerializer(serializers.ModelSerializer):
         fields = ['name', 'filter_data', 'notifications_enabled']
 ```
 
+# core\services\location.py
+
+```py
+from math import radians, sin, cos, sqrt, atan2
+from typing import List, Optional, Dict, Any
+from django.db.models import Q
+from core.models import Location
+from core.cache import (
+    get_cached_countries,
+    get_cached_states,
+    get_cached_cities
+)
+
+class LocationService:
+    @staticmethod
+    def get_location_hierarchy(location_id: int) -> List[Dict[str, Any]]:
+        """Get full location hierarchy from city up to country"""
+        location = Location.objects.get(id=location_id)
+        return location.get_hierarchy()
+    
+    @staticmethod
+    def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Calculate distance between two points using Haversine formula"""
+        R = 6371  # Earth's radius in km
+        
+        lat1, lon1 = map(radians, [lat1, lon1])
+        lat2, lon2 = map(radians, [lat2, lon2])
+        
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        
+        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+        c = 2 * atan2(sqrt(a), sqrt(1-a))
+        
+        return R * c
+    
+    @staticmethod
+    def find_locations_in_radius(
+        latitude: float,
+        longitude: float,
+        radius: float,
+        level: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Find all locations within specified radius"""
+        locations = Location.objects.filter(level=level)
+        
+        results = []
+        for location in locations:
+            if location.latitude and location.longitude:
+                distance = LocationService.calculate_distance(
+                    latitude, longitude,
+                    float(location.latitude),
+                    float(location.longitude)
+                )
+                if distance <= radius:
+                    results.append({
+                        'id': location.id,
+                        'name': location.name,
+                        'distance': round(distance, 2),
+                        'latitude': location.latitude,
+                        'longitude': location.longitude,
+                        'full_name': location.full_name
+                    })
+        
+        return sorted(results, key=lambda x: x['distance'])
+
+    @staticmethod
+    def search_locations(
+        query: str,
+        level: Optional[int] = None,
+        country_id: Optional[int] = None,
+        limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Search locations by name with optional filters"""
+        locations = Location.objects.all()
+        
+        if level is not None:
+            locations = locations.filter(level=level)
+        
+        if country_id:
+            locations = locations.filter(
+                Q(id=country_id) |  # Country itself
+                Q(country_id=country_id)  # States and cities
+            )
+        
+        # Split query into words and create Q objects for each
+        words = query.split()
+        name_query = Q()
+        for word in words:
+            name_query |= Q(name__icontains=word)
+        
+        locations = locations.filter(name_query)[:limit]
+        
+        return [
+            {
+                'id': loc.id,
+                'name': loc.name,
+                'level': loc.level,
+                'full_name': loc.full_name,
+                'latitude': loc.latitude,
+                'longitude': loc.longitude
+            }
+            for loc in locations
+        ]
+
+    @staticmethod
+    def get_location_choices(
+        level: int,
+        parent_id: Optional[int] = None,
+        country_id: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Get location choices for dropdowns"""
+        if level == 1:
+            return get_cached_countries()
+        elif level == 2 and country_id:
+            return get_cached_states(country_id)
+        elif level == 3:
+            if parent_id:  # Cities of state
+                return get_cached_cities(parent_id, is_state=True)
+            elif country_id:  # Cities of country
+                return get_cached_cities(country_id, is_state=False)
+        return []
+
+    @staticmethod
+    def validate_location_path(
+        city_id: Optional[int] = None,
+        state_id: Optional[int] = None,
+        country_id: Optional[int] = None
+    ) -> bool:
+        """Validate that locations form a valid path in hierarchy"""
+        try:
+            if city_id:
+                city = Location.objects.get(id=city_id, level=3)
+                if state_id and city.parent_id != state_id:
+                    return False
+                if country_id and city.country_id != country_id:
+                    return False
+                
+            if state_id:
+                state = Location.objects.get(id=state_id, level=2)
+                if country_id and state.country_id != country_id:
+                    return False
+                
+            return True
+            
+        except Location.DoesNotExist:
+            return False
+```
+
 # core\services\telegram.py
 
 ```py
+from typing import List, Dict, Any, Tuple, Union
 import logging
-from typing import List, Optional
-from telegram.ext import Application
-from telegram import Bot
+import requests
 from django.conf import settings
-from django.core.cache import cache
-from concurrent.futures import ThreadPoolExecutor
-import telegram.error
-from users.models import User
-from cargo.models import Cargo, CarrierRequest
+from celery import shared_task
 
 logger = logging.getLogger(__name__)
 
 class TelegramNotificationService:
     def __init__(self):
         self.token = settings.TELEGRAM_BOT_TOKEN
-        self.executor = ThreadPoolExecutor(max_workers=4)
-        
-    def _send_message_sync(
-        self,
-        chat_id: str,
-        message: str,
-        silent: bool = False
-    ) -> bool:
-        """Send message synchronously using python-telegram-bot"""
-        try:
-            bot = Bot(token=self.token)
-            bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                parse_mode='HTML',
-                disable_notification=silent
-            )
-            return True
-        except telegram.error.TelegramError as e:
-            logger.error(f"Failed to send Telegram message to {chat_id}: {str(e)}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error sending message to {chat_id}: {str(e)}")
-            return False
+        self.api_url = f"https://api.telegram.org/bot{self.token}"
 
-    def send_message(
-        self,
-        chat_id: str,
-        message: str,
-        silent: bool = False
-    ) -> bool:
-        """Send message using thread pool"""
+    def send_message(self, chat_id: str, message: str) -> bool:
+        """Send message to a telegram chat"""
         try:
-            future = self.executor.submit(
-                self._send_message_sync,
-                chat_id,
-                message,
-                silent
+            response = requests.post(
+                f"{self.api_url}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": "HTML"
+                }
             )
-            return future.result(timeout=10)  # 10 second timeout
-        except Exception as e:
-            logger.error(f"Error in send_message thread: {str(e)}")
-            return False
-
-    def send_bulk_messages(
-        self,
-        messages: List[tuple[str, str]],
-        rate_limit: int = 30
-    ) -> None:
-        """Send multiple messages with rate limiting"""
-        from time import sleep
-        
-        for chat_id, message in messages:
-            # Rate limit: max 30 messages per second
-            if not cache.add(f'telegram_ratelimit_{chat_id}', 1, timeout=1):
-                sleep(1 / rate_limit)
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to send Telegram message: {response.text}")
+                return False
                 
-            self.send_message(chat_id, message)
+            return True
+        except Exception as e:
+            logger.error(f"Error sending Telegram message: {str(e)}")
+            return False
 
-    def format_cargo_notification(self, cargo: 'Cargo', action: str) -> str:
-        """Format cargo notification message"""
+    @staticmethod
+    @shared_task
+    def send_notification(telegram_id: str, message: str) -> bool:
+        """Celery task to send notification to a user"""
+        service = TelegramNotificationService()
+        return service.send_message(telegram_id, message)
+
+    @staticmethod
+    @shared_task
+    def send_bulk_messages(messages: List[Union[Dict[str, str], Tuple[str, str]]]) -> None:
+        """Send multiple messages via Celery"""
+        service = TelegramNotificationService()
+        for msg in messages:
+            # Handle both dict and tuple formats
+            if isinstance(msg, dict):
+                telegram_id = msg.get("telegram_id")
+                message = msg.get("message")
+            elif isinstance(msg, tuple) and len(msg) >= 2:
+                telegram_id, message = msg[0], msg[1]
+            else:
+                logger.error(f"Invalid message format: {msg}")
+                continue
+                
+            if telegram_id and message:
+                service.send_message(telegram_id, message)
+
+    def format_cargo_notification(self, cargo: Any, action: str) -> str:
+        """Format a cargo notification message"""
         return f"""
-🚛 <b>Уведомление о грузе</b>
-
-{action}
+🚛 <b>{action}</b>
 
 <b>Груз:</b> {cargo.title}
 <b>Маршрут:</b> {cargo.loading_point} ➡️ {cargo.unloading_point}
 <b>Вес:</b> {cargo.weight} т
-{f'<b>Объем:</b> {cargo.volume} м³' if cargo.volume else ''}
 <b>Тип транспорта:</b> {cargo.get_vehicle_type_display()}
-<b>Оплата:</b> {cargo.get_payment_method_display()}
-{f'<b>Цена:</b> {cargo.price} ₽' if cargo.price else ''}
+<b>Статус:</b> {cargo.get_status_display()}
 
 👉 Перейдите в приложение для подробностей
 """
 
-    def format_carrier_notification(
-        self,
-        carrier_request: 'CarrierRequest',
-        action: str
-    ) -> str:
-        """Format carrier request notification message"""
+    def format_carrier_notification(self, request: Any, action: str) -> str:
+        """Format a carrier request notification message"""
         return f"""
-🚚 <b>Уведомление о заявке перевозчика</b>
+🚚 <b>{action}</b>
 
-{action}
-
-<b>Перевозчик:</b> {carrier_request.carrier.get_full_name()}
-<b>Транспорт:</b> {carrier_request.vehicle.registration_number}
-<b>Маршрут:</b> {carrier_request.loading_point} ➡️ {carrier_request.unloading_point}
-<b>Дата готовности:</b> {carrier_request.ready_date.strftime('%d.%m.%Y')}
+<b>Перевозчик:</b> {request.carrier.get_full_name()}
+<b>Транспорт:</b> {request.vehicle.registration_number}
+<b>Маршрут:</b> {request.loading_point} ➡️ {request.unloading_point}
+<b>Статус:</b> {request.get_status_display()}
 
 👉 Перейдите в приложение для подробностей
 """
 
-    def format_verification_notification(
-        self,
-        user: 'User',
-        action: str
-    ) -> str:
-        """Format verification notification message"""
-        return f"""
-✅ <b>Уведомление о верификации</b>
+    def notify_users(self, recipients: List[Any], message: str) -> None:
+        """Send notification to multiple users"""
+        # Create list of (telegram_id, message) tuples for users with telegram_id
+        messages = [
+            (user.telegram_id, message)
+            for user in recipients
+            if user.telegram_id
+        ]
+        
+        # Send messages if we have any recipients
+        if messages:
+            self.send_bulk_messages.delay(messages)
 
-{action}
-
-<b>Пользователь:</b> {user.get_full_name()}
-<b>Статус:</b> {'Верифицирован' if user.is_verified else 'Ожидает проверки'}
-
-👉 Перейдите в приложение для подробностей
-"""
 
 telegram_service = TelegramNotificationService()
 ```
@@ -2798,238 +4369,183 @@ def send_telegram_notification(sender, instance, created, **kwargs):
     except Exception as e:
         logger.error(f"Failed to send Telegram notification: {str(e)}")
 
+
 @receiver(post_save, sender=Cargo)
 def notify_cargo_status_change(sender, instance, created, **kwargs):
-    """Create notifications for cargo status changes"""
+    """Send notifications for cargo status changes"""
     if created:
         return
         
-    if instance.tracker.has_changed('status'):
-        old_status = instance.tracker.previous('status')
+    # We can't use tracker since it's not configured
+    # Instead, we'll check for status changes based on the "_original_status" 
+    # attribute which is set in pre_save in cargo/signals.py
+    if hasattr(instance, '_original_status') and instance._original_status != instance.status:
+        old_status = instance._original_status
         new_status = instance.status
         
         # Determine who should be notified
         recipients = []
+        action = ""
         
         if new_status == 'pending_approval':
             # Notify managers
-            recipients = User.objects.filter(role='manager', is_active=True)
-            message = f"Новый груз требует проверки: {instance.title}"
+            recipients = User.objects.filter(
+                role='manager',
+                is_active=True,
+                telegram_id__isnull=False
+            )
+            action = f"Новый груз требует проверки: {instance.title}"
             
         elif new_status == 'manager_approved':
             # Notify students
-            recipients = User.objects.filter(role='student', is_active=True)
-            message = f"Новый груз доступен: {instance.title}"
+            recipients = User.objects.filter(
+                role='student',
+                is_active=True,
+                telegram_id__isnull=False
+            )
+            action = f"Новый груз доступен: {instance.title}"
             
         elif new_status == 'assigned':
             # Notify carrier
-            recipients = [instance.assigned_to]
-            message = f"Вам назначен груз: {instance.title}"
-            
-        # Create notifications
-        for recipient in recipients:
-            Notification.objects.create(
-                user=recipient,
-                type='cargo',
-                message=message,
-                content_object=instance
-            )
+            if instance.assigned_to and instance.assigned_to.telegram_id:
+                recipients = [instance.assigned_to]
+                action = f"Вам назначен груз: {instance.title}"
+
+        # Send notifications via Telegram
+        if recipients and action:
+            for recipient in recipients:
+                if recipient.telegram_id:
+                    telegram_service.send_notification.delay(
+                        recipient.telegram_id, 
+                        telegram_service.format_cargo_notification(instance, action)
+                    )
+
+@receiver(post_save, sender=CarrierRequest)
+def notify_carrier_request_status_change(sender, instance, created, **kwargs):
+    """Send notifications for carrier request status changes"""
+    if created:
+        return
+        
+    if hasattr(instance, '_original_status') and instance._original_status != instance.status:
+        old_status = instance._original_status
+        new_status = instance.status
+        
+        recipients = []
+        action = ""
+        
+        if new_status == 'assigned':
+            if instance.carrier and instance.carrier.telegram_id:
+                recipients = [instance.carrier]
+                action = "Вам назначен груз"
+                
+        elif new_status in ['accepted', 'rejected']:
+            if instance.assigned_by and instance.assigned_by.telegram_id:
+                recipients = [instance.assigned_by]
+                action = f"Перевозчик {'принял' if new_status == 'accepted' else 'отклонил'} назначенный груз"
+
+        # Send notifications via Telegram
+        if recipients and action:
+            for recipient in recipients:
+                if recipient.telegram_id:
+                    telegram_service.send_notification.delay(
+                        recipient.telegram_id,
+                        telegram_service.format_carrier_notification(instance, action)
+                    )
 ```
 
 # core\tasks.py
 
 ```py
-import logging
 from celery import shared_task
-from django.db import transaction
 from django.utils import timezone
-from django.conf import settings
 from datetime import timedelta
-import telegram
-from .models import (
-    TelegramGroup, TelegramMessage,
-    Notification, SearchFilter
-)
-from cargo.models import Cargo
+from django.conf import settings
+from django.contrib.auth import get_user_model
+import logging
 
 logger = logging.getLogger(__name__)
-
-@shared_task
-def sync_telegram_groups():
-    """
-    Synchronize messages from Telegram groups
-    """
-    try:
-        bot = telegram.Bot(token=settings.TELEGRAM_BOT_TOKEN)
-        
-        for group in TelegramGroup.objects.filter(is_active=True):
-            try:
-                # Get updates from telegram
-                updates = bot.get_updates(offset=-1, timeout=30)
-                
-                for update in updates:
-                    if not update.message:
-                        continue
-                    
-                    # Skip if message already exists
-                    if TelegramMessage.objects.filter(
-                        telegram_id=str(update.message.message_id)
-                    ).exists():
-                        continue
-                    
-                    # Create new message
-                    TelegramMessage.objects.create(
-                        telegram_id=str(update.message.message_id),
-                        group=group,
-                        message_text=update.message.text
-                    )
-                
-                # Update last sync time
-                group.last_sync = timezone.now()
-                group.save()
-                
-            except Exception as e:
-                logger.error(
-                    f"Error syncing group {group.name}: {str(e)}"
-                )
-                continue
-            
-    except Exception as e:
-        logger.error(f"Error in sync_telegram_groups: {str(e)}")
-        raise
-
-@shared_task
-def process_telegram_messages():
-    """
-    Process unprocessed Telegram messages and create cargo entries
-    """
-    try:
-        messages = TelegramMessage.objects.filter(
-            processed=False
-        ).select_related('group')
-        
-        for message in messages:
-            try:
-                with transaction.atomic():
-                    # Extract cargo information from message
-                    cargo_data = parse_cargo_message(message.message_text)
-                    
-                    if cargo_data:
-                        # Create cargo entry
-                        cargo = Cargo.objects.create(
-                            source_type='telegram',
-                            source_id=message.telegram_id,
-                            **cargo_data
-                        )
-                        
-                        message.cargo = cargo
-                        message.processed = True
-                        message.processed_at = timezone.now()
-                        message.save()
-                        
-                        # Notify users with matching search filters
-                        notify_matching_users.delay(cargo.id)
-                    
-            except Exception as e:
-                logger.error(
-                    f"Error processing message {message.telegram_id}: {str(e)}"
-                )
-                continue
-                
-    except Exception as e:
-        logger.error(f"Error in process_telegram_messages: {str(e)}")
-        raise
-
-@shared_task
-def notify_matching_users(cargo_id):
-    """
-    Notify users with matching search filters about new cargo
-    """
-    try:
-        cargo = Cargo.objects.get(id=cargo_id)
-        
-        # Get all active search filters
-        filters = SearchFilter.objects.filter(
-            notifications_enabled=True
-        ).select_related('user')
-        
-        for filter_obj in filters:
-            try:
-                # Check if cargo matches filter criteria
-                if cargo_matches_filter(cargo, filter_obj.filter_data):
-                    # Create notification
-                    Notification.objects.create(
-                        user=filter_obj.user,
-                        type='cargo',
-                        message=f'New cargo matching your filter "{filter_obj.name}": {cargo.title}',
-                        content_object=cargo
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Error processing filter {filter_obj.id}: {str(e)}"
-                )
-                continue
-                
-    except Exception as e:
-        logger.error(f"Error in notify_matching_users: {str(e)}")
-        raise
+User = get_user_model()
 
 @shared_task
 def clean_old_notifications():
-    """
-    Remove notifications older than 30 days
-    """
-    try:
-        threshold = timezone.now() - timedelta(days=30)
-        Notification.objects.filter(created_at__lt=threshold).delete()
-    except Exception as e:
-        logger.error(f"Error in clean_old_notifications: {str(e)}")
-        raise
+    """Remove notifications older than 30 days"""
+    from core.models import Notification
+    
+    threshold = timezone.now() - timedelta(days=30)
+    deleted_count = Notification.objects.filter(created_at__lt=threshold).delete()[0]
+    
+    logger.info(f"Cleaned {deleted_count} old notifications")
 
 @shared_task
 def check_expired_cargos():
-    """
-    Check for expired cargo listings and notify owners
-    """
-    try:
-        threshold = timezone.now().date()
-        expired_cargos = Cargo.objects.filter(
-            status='active',
-            loading_date__lt=threshold
-        )
+    """Check for expired cargo listings and notify owners"""
+    from cargo.models import Cargo
+    from core.services.telegram import telegram_service
+    
+    threshold = timezone.now().date()
+    expired_cargos = Cargo.objects.filter(
+        status__in=['pending', 'manager_approved'],
+        loading_date__lt=threshold
+    )
+    
+    for cargo in expired_cargos:
+        # Update cargo status
+        cargo.status = Cargo.CargoStatus.EXPIRED
+        cargo.save()
         
-        for cargo in expired_cargos:
-            # Create notification for cargo owner
-            Notification.objects.create(
-                user=cargo.owner,
-                type='cargo',
-                message=f'Your cargo listing "{cargo.title}" has expired',
-                content_object=cargo
+        # Notify owner if they exist
+        if cargo.owner and cargo.owner.telegram_id:
+            message = f"""
+⚠️ <b>Груз просрочен</b>
+
+<b>Груз:</b> {cargo.title}
+<b>Маршрут:</b> {cargo.loading_point} ➡️ {cargo.unloading_point}
+<b>Дата загрузки:</b> {cargo.loading_date.strftime('%d.%m.%Y')}
+
+Статус груза изменен на "Просрочен".
+"""
+            telegram_service.send_notification.delay(
+                cargo.owner.telegram_id,
+                message
             )
-            
-            # Update cargo status
-            cargo.status = 'expired'
-            cargo.save()
-            
-    except Exception as e:
-        logger.error(f"Error in check_expired_cargos: {str(e)}")
-        raise
+    
+    logger.info(f"Marked {expired_cargos.count()} cargos as expired")
 
-def parse_cargo_message(message_text):
-    """
-    Parse cargo information from Telegram message
-    This is a placeholder - implement actual parsing logic
-    """
-    # TODO: Implement message parsing using NLP or pattern matching
-    return None
+@shared_task
+def check_expiring_documents():
+    """Check for vehicle documents that are about to expire and notify owners"""
+    from vehicles.models import VehicleDocument
+    from core.services.telegram import telegram_service
+    
+    # Check documents expiring in the next 7 days
+    soon = timezone.now().date() + timedelta(days=7)
+    expiring_docs = VehicleDocument.objects.filter(
+        expiry_date__lte=soon,
+        expiry_date__gte=timezone.now().date()
+    ).select_related('vehicle', 'vehicle__owner')
+    
+    for doc in expiring_docs:
+        owner = doc.vehicle.owner
+        if owner and owner.telegram_id:
+            days_left = (doc.expiry_date - timezone.now().date()).days
+            
+            message = f"""
+⚠️ <b>Скоро истекает срок действия документа</b>
 
-def cargo_matches_filter(cargo, filter_data):
-    """
-    Check if cargo matches filter criteria
-    This is a placeholder - implement actual matching logic
-    """
-    # TODO: Implement filter matching logic
-    return False
+<b>Транспорт:</b> {doc.vehicle.registration_number}
+<b>Документ:</b> {doc.get_type_display()}
+<b>Название:</b> {doc.title}
+<b>Срок действия:</b> {doc.expiry_date.strftime('%d.%m.%Y')}
+<b>Осталось дней:</b> {days_left}
+
+Пожалуйста, обновите документ до истечения срока.
+"""
+            telegram_service.send_notification.delay(
+                owner.telegram_id,
+                message
+            )
+    
+    logger.info(f"Sent notifications for {expiring_docs.count()} expiring documents")
 ```
 
 # core\urls.py
@@ -3043,7 +4559,8 @@ from .views import (
     RatingViewSet,
     TelegramGroupViewSet,
     TelegramMessageViewSet,
-    SearchFilterViewSet
+    SearchFilterViewSet,
+    LocationViewSet
 )
 
 router = DefaultRouter()
@@ -3053,6 +4570,7 @@ router.register(r'ratings', RatingViewSet, basename='rating')
 router.register(r'telegram-groups', TelegramGroupViewSet)
 router.register(r'telegram-messages', TelegramMessageViewSet)
 router.register(r'search-filters', SearchFilterViewSet, basename='search-filter')
+router.register(r'locations', LocationViewSet, basename='location')
 
 urlpatterns = [
     path('', include(router.urls)),
@@ -3079,7 +4597,115 @@ from .serializers import (
     SearchFilterUpdateSerializer
 )
 from .permissions import IsVerifiedUser, IsStaffOrReadOnly
- 
+from django.db.models import F, FloatField
+from django.db.models.functions import Power, Sqrt
+from django.contrib.postgres.search import SearchVector, SearchQuery
+from .models import Location
+from .serializers import (
+    LocationListSerializer,
+    LocationDetailSerializer,
+    LocationSearchSerializer
+)
+
+class LocationViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Location.objects.all()
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name']
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return LocationListSerializer
+        if self.action in ['nearest', 'search']:
+            return LocationSearchSerializer
+        return LocationDetailSerializer
+
+    @action(detail=False)
+    def countries(self, request):
+        """Get list of countries"""
+        countries = Location.objects.filter(level=1)
+        serializer = self.get_serializer(countries, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False)
+    def states(self, request):
+        """Get states/regions for a country"""
+        country_id = request.query_params.get('country_id')
+        if not country_id:
+            return Response({'error': 'country_id parameter is required'}, status=400)
+            
+        states = Location.objects.filter(
+            level=2,
+            country_id=country_id
+        )
+        serializer = self.get_serializer(states, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False)
+    def cities(self, request):
+        """Get cities for a state or country"""
+        state_id = request.query_params.get('state_id')
+        country_id = request.query_params.get('country_id')
+        
+        if not (state_id or country_id):
+            return Response(
+                {'error': 'Either state_id or country_id parameter is required'},
+                status=400
+            )
+            
+        cities = Location.objects.filter(level=3)
+        if state_id:
+            cities = cities.filter(parent_id=state_id)
+        elif country_id:
+            cities = cities.filter(country_id=country_id)
+            
+        serializer = self.get_serializer(cities, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False)
+    def nearest(self, request):
+        """Find locations within specified radius"""
+        try:
+            lat = float(request.query_params.get('lat', 0))
+            lon = float(request.query_params.get('lon', 0))
+            radius = float(request.query_params.get('radius', 100))  # km
+            level = int(request.query_params.get('level', 3))  # Default to cities
+        except (TypeError, ValueError):
+            return Response({'error': 'Invalid parameters'}, status=400)
+
+        # Calculate distances using the Haversine formula approximation
+        # This formula works well for PostgreSQL
+        locations = Location.objects.filter(level=level).annotate(
+            distance=Sqrt(
+                Power(69.1 * (F('latitude') - lat), 2) +
+                Power(69.1 * (F('longitude') - lon) * 0.73, 2)
+            ).annotate(distance=FloatField())
+        ).filter(distance__lte=radius).order_by('distance')
+
+        serializer = self.get_serializer(locations, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False)
+    def search(self, request):
+        """Search locations by name with full text search"""
+        query = request.query_params.get('q', '')
+        if not query:
+            return Response({'error': 'Search query is required'}, status=400)
+
+        locations = Location.objects.annotate(
+            search=SearchVector('name')
+        ).filter(search=SearchQuery(query))
+
+        serializer = self.get_serializer(locations, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True)
+    def children(self, request, pk=None):
+        """Get direct child locations"""
+        location = self.get_object()
+        children = Location.objects.filter(parent=location)
+        serializer = self.get_serializer(children, many=True)
+        return Response(serializer.data)
+    
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -3270,29 +4896,24 @@ def debug_task(self):
 from celery.schedules import crontab
 from logit_backend.celery import app
 from core.tasks import (
-    sync_telegram_groups,
-    process_telegram_messages,
     clean_old_notifications,
-    check_expired_cargos
+    check_expired_cargos,
+    check_expiring_documents
 )
 
 # Schedule periodic tasks
 app.conf.beat_schedule = {
-    'sync-telegram-groups': {
-        'task': 'core.tasks.sync_telegram_groups',
-        'schedule': crontab(minute='*/5'),  # Every 5 minutes
-    },
-    'process-telegram-messages': {
-        'task': 'core.tasks.process_telegram_messages',
-        'schedule': crontab(minute='*/2'),  # Every 2 minutes
-    },
     'clean-old-notifications': {
         'task': 'core.tasks.clean_old_notifications',
         'schedule': crontab(hour=0, minute=0),  # Daily at midnight
     },
     'check-expired-cargos': {
         'task': 'core.tasks.check_expired_cargos',
-        'schedule': crontab(hour='*/1'),  # Every hour
+        'schedule': crontab(hour='*/3'),  # Every 3 hours
+    },
+    'check-expiring-documents': {
+        'task': 'core.tasks.check_expiring_documents',
+        'schedule': crontab(hour=9, minute=0),  # Daily at 9 AM
     },
 }
 ```
@@ -3520,7 +5141,8 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'your-secret-key-for-development')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DJANGO_DEBUG', 'True') == 'True'
-EXTERNAL_API_KEY = os.getenv('EXTERNAL_API_KEY', 'test')
+PRIVATE_API_KEY = os.getenv('PRIVATE_API_KEY', 'testp')
+EXTERNAL_API_KEY = os.getenv('EXTERNAL_API_KEY', 'testpb')
 
 ALLOWED_HOSTS = ['*']
 # os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,https://f623-84-54-80-95.ngrok-free.app,http://localhost:3000,').split(',')
@@ -3686,6 +5308,7 @@ CORS_ALLOWED_ORIGINS = [
     # '*',  # Allow all origins
     'http://localhost:3000',
     'http://127.0.0.1:3000',
+    'https://e79e-213-230-76-173.ngrok-free.app',
     'https://d0af-94-230-229-138.ngrok-free.app',
     'https://f623-84-54-80-95.ngrok-free.app',      
 
@@ -3847,10 +5470,22 @@ if __name__ == '__main__':
 
 ```
 
+# media\user_documents\wavy-black-white-background.jpg
+
+This is a binary file of the type: Image
+
+# media\vehicle_documents\wavy-black-white-background_uKSy2Xa.jpg
+
+This is a binary file of the type: Image
+
+# media\vehicle_documents\wavy-black-white-background.jpg
+
+This is a binary file of the type: Image
+
 # README.md
 
 ```md
-# Logit Platform - Logistics Management System ![Logit Platform](logit\app\blue.png) ## Overview Logit Platform is a comprehensive logistics management system designed to streamline cargo transportation and logistics operations. The platform connects cargo owners, carriers, logistics companies, and logistics students in a unified ecosystem. ## 🌟 Key Features ### Authentication & User Management - Telegram WebApp authentication integration - Multi-role user system (Carriers, Cargo Owners, Logistics Companies, Students) - Profile management with document verification - Role-based access control - Language selection (Russian/Uzbek) ### Cargo Management - Create and manage cargo listings - Advanced cargo search with filtering - Real-time cargo status tracking - Multi-point route support - Automatic cargo matching with carriers - Price negotiation system - Document management for cargo ### Vehicle Management - Detailed vehicle registration and management - Vehicle document verification - Technical specifications tracking - Vehicle availability management - ADR/TIR/DOZVOL certification support - Vehicle inspection history ### Carrier Features - Vehicle fleet management - Cargo acceptance/rejection system - Real-time cargo notifications - Document upload and verification - Route planning and tracking - Availability management ### Student Features - Access to logistics training - Supervised cargo management - Learning progression tracking - Practice with real cargo listings - Mentor assignment system ### Platform Features - Real-time notifications - Favorites system - Rating and review system - Distance calculation - Advanced search filters - Document verification system - Multi-language support - Telegram group integration ## 🔧 Technology Stack ### Frontend - Next.js 14 (App Router) - TypeScript - TailwindCSS - Shadcn/ui Components - Telegram WebApp SDK - React Query - Axios - Framer Motion ### Backend - Django - Django REST Framework - PostgreSQL - Redis - Celery - JWT Authentication - Swagger/OpenAPI ## 📦 Installation ### Prerequisites - Node.js 18+ - Python 3.10+ - PostgreSQL - Redis - Telegram Bot Token ### Frontend Setup 1. Clone the repository: \`\`\`bash git clone https://github.com/your-username/logit-platform.git cd logit-platform/frontend \`\`\` 2. Install dependencies: \`\`\`bash npm install \`\`\` 3. Create .env.local: \`\`\`env NEXT_PUBLIC_API_URL=http://localhost:8000/api NEXT_PUBLIC_TELEGRAM_BOT_TOKEN=your_telegram_bot_token \`\`\` 4. Run development server: \`\`\`bash npm run dev \`\`\` ### Backend Setup 1. Navigate to backend directory: \`\`\`bash cd backend \`\`\` 2. Create virtual environment: \`\`\`bash python -m venv venv source venv/bin/activate # Linux/Mac venv\Scripts\activate # Windows \`\`\` 3. Install dependencies: \`\`\`bash pip install -r requirements.txt \`\`\` 4. Create .env: \`\`\`env DJANGO_SECRET_KEY=your_secret_key DJANGO_DEBUG=True TELEGRAM_BOT_TOKEN=your_telegram_bot_token POSTGRES_DB=logit_db POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_HOST=localhost POSTGRES_PORT=5432 \`\`\` 5. Run migrations: \`\`\`bash python manage.py migrate \`\`\` 6. Start development server: \`\`\`bash python manage.py runserver \`\`\` ## 🏗 Project Structure ### Frontend Structure \`\`\` ├── app/ # Next.js app directory │ ├── (auth)/ # Authentication pages │ ├── cargo/ # Cargo management pages │ ├── vehicles/ # Vehicle management pages │ ├── components/ # Shared components │ ├── contexts/ # React contexts │ ├── hooks/ # Custom hooks │ └── lib/ # Utilities and API ├── public/ # Static files └── components/ # UI components \`\`\` ### Backend Structure \`\`\` ├── cargo/ # Cargo management ├── vehicles/ # Vehicle management ├── users/ # User management ├── core/ # Core functionality └── logit_backend/ # Project settings \`\`\` ## 🚀 Features In Detail ### User Registration Flow 1. User opens Telegram bot 2. Selects language preference 3. Chooses user type (Individual/Legal Entity) 4. Selects role (Carrier/Cargo Owner/etc.) 5. Fills profile information 6. Uploads required documents 7. Awaits verification (if required) ### Cargo Management Flow 1. Cargo owner creates cargo listing 2. System processes and validates cargo information 3. Students can view and manage cargo listings 4. Students can match cargo with carriers 5. Carriers receive notification and can accept/reject 6. System tracks cargo status throughout delivery ### Vehicle Management Flow 1. Carrier registers vehicles 2. Uploads required documentation 3. System verifies vehicle information 4. Carrier can update vehicle availability 5. System matches vehicles with compatible cargo 6. Tracks vehicle status and documents expiry ### Student Learning Flow 1. Student registers with group information 2. Gets assigned to mentor 3. Can view and practice with real cargo listings 4. Manages cargo-carrier matching 5. Receives feedback from mentors 6. Tracks learning progress ## 🔐 Security - JWT-based authentication - Role-based access control - Document verification system - Secure file uploads - HTTPS encryption - Input validation - Rate limiting - Session management ## 📱 Mobile Responsiveness The platform is fully responsive and optimized for: - Desktop browsers - Mobile devices - Telegram WebApp - Tablets ## 🌐 API Documentation API documentation is available at: - Swagger UI: `/api/docs/` - ReDoc: `/api/redoc/` ## 🤝 Contributing Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests. ## 📄 License This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details ## 👥 Team - Product Owner: [Name] - Lead Developer: [Name] - Backend Developer: [Name] - Frontend Developer: [Name] - UI/UX Designer: [Name] ## 📞 Support For support, please contact: - Email: support@logit.com - Telegram: @logit_support - Website: https://logit.com/support ## 🌟 Acknowledgments - Telegram for WebApp SDK - Shadcn for UI components - All contributors and testers ## 🗺 Roadmap ### Phase 1 (Current) - Core platform functionality - Basic cargo management - Vehicle registration - User authentication ### Phase 2 (Planned) - Advanced analytics - Mobile applications - Real-time tracking - Payment integration - AI-powered matching ### Phase 3 (Future) - International expansion - Blockchain integration - IoT device support - Advanced automation ## ⚙ Configuration ### Environment Variables #### Frontend \`\`\`env NEXT_PUBLIC_API_URL= NEXT_PUBLIC_TELEGRAM_BOT_TOKEN= \`\`\` #### Backend \`\`\`env DJANGO_SECRET_KEY= DJANGO_DEBUG= TELEGRAM_BOT_TOKEN= POSTGRES_DB= POSTGRES_USER= POSTGRES_PASSWORD= POSTGRES_HOST= POSTGRES_PORT= \`\`\` ## 🚀 Deployment ### Frontend Deployment 1. Build the application: \`\`\`bash npm run build \`\`\` 2. Start production server: \`\`\`bash npm start \`\`\` ### Backend Deployment 1. Collect static files: \`\`\`bash python manage.py collectstatic \`\`\` 2. Configure Gunicorn: \`\`\`bash gunicorn logit_backend.wsgi:application \`\`\` 3. Set up Nginx as reverse proxy ## 📊 Monitoring - Application logs - Error tracking - Performance monitoring - User analytics - System health checks ## 🔄 Backup & Recovery - Database backups - File system backups - Recovery procedures - Data retention policies ## 🏆 Best Practices - Clean code principles - Component reusability - Type safety - Error handling - Performance optimization - Security measures - Documentation - Testing ## 🎯 Goals 1. Streamline logistics operations 2. Connect industry participants 3. Provide practical training 4. Ensure safety and compliance 5. Foster industry growth --- **Note**: This project is actively maintained and regularly updated. For the latest features and changes, please check the CHANGELOG.md file.
+# Logit Platform - Logistics Management System ![Logit Platform](logit\app\blue.png) for local development u can do ts in order to not install postgres \`\`\` DATABASES = { 'default': { 'ENGINE': 'django.db.backends.sqlite3', 'NAME': BASE_DIR / 'db.sqlite3', } } \`\`\` ## Overview Logit Platform is a comprehensive logistics management system designed to streamline cargo transportation and logistics operations. The platform connects cargo owners, carriers, logistics companies, and logistics students in a unified ecosystem. ## 🌟 Key Features ### Authentication & User Management - Telegram WebApp authentication integration - Multi-role user system (Carriers, Cargo Owners, Logistics Companies, Students) - Profile management with document verification - Role-based access control - Language selection (Russian/Uzbek) ### Cargo Management - Create and manage cargo listings - Advanced cargo search with filtering - Real-time cargo status tracking - Multi-point route support - Automatic cargo matching with carriers - Price negotiation system - Document management for cargo ### Vehicle Management - Detailed vehicle registration and management - Vehicle document verification - Technical specifications tracking - Vehicle availability management - ADR/TIR/DOZVOL certification support - Vehicle inspection history ### Carrier Features - Vehicle fleet management - Cargo acceptance/rejection system - Real-time cargo notifications - Document upload and verification - Route planning and tracking - Availability management ### Student Features - Access to logistics training - Supervised cargo management - Learning progression tracking - Practice with real cargo listings - Mentor assignment system ### Platform Features - Real-time notifications - Favorites system - Rating and review system - Distance calculation - Advanced search filters - Document verification system - Multi-language support - Telegram group integration ## 🔧 Technology Stack ### Frontend - Next.js 14 (App Router) - TypeScript - TailwindCSS - Shadcn/ui Components - Telegram WebApp SDK - React Query - Axios - Framer Motion ### Backend - Django - Django REST Framework - PostgreSQL - Redis - Celery - JWT Authentication - Swagger/OpenAPI ## 📦 Installation ### Prerequisites - Node.js 18+ - Python 3.10+ - PostgreSQL - Redis - Telegram Bot Token ### Frontend Setup 1. Clone the repository: \`\`\`bash git clone https://github.com/HumoyunXujaev/logit-fronttt cd logit \`\`\` 2. Install dependencies: \`\`\`bash npm install \`\`\` 3. Create .env.local: \`\`\`env NEXT_PUBLIC_API_URL=http://localhost:8000/api NEXT_PUBLIC_TELEGRAM_BOT_TOKEN=your_telegram_bot_token \`\`\` 4. Run development server: \`\`\`bash npm run dev \`\`\` 5. setup ngrok (telegram web app doesn't work with localhost): \`\`\`bash ngrok http 3000 \`\`\` ### Backend Setup 1. Clone the repository: \`\`\`bash git clone https://github.com/HumoyunXujaev/logit-backend/ cd logit_backend \`\`\` 2. Create virtual environment: \`\`\`bash python -m venv venv source venv/bin/activate # Linux/Mac venv\Scripts\activate # Windows \`\`\` 3. Install dependencies: \`\`\`bash pip install -r requirements.txt \`\`\` 4. Create .env: \`\`\`env DJANGO_SECRET_KEY=your_secret_key DJANGO_DEBUG=True TELEGRAM_BOT_TOKEN=your_telegram_bot_token POSTGRES_DB=logit_db POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_HOST=localhost POSTGRES_PORT=5432 \`\`\` 5. Run migrations: \`\`\`bash python manage.py makemigrations \`\`\` \`\`\`bash python manage.py migrate \`\`\` 6. Start development server: \`\`\`bash python manage.py runserver \`\`\` ## 🏗 Project Structure ### Backend Structure \`\`\` ├── cargo/ # Cargo management ├── vehicles/ # Vehicle management ├── users/ # User management ├── core/ # Core functionality └── logit_backend/ # Project settings \`\`\` ## 🚀 Features In Detail ### User Registration Flow 1. User opens Telegram bot 2. Selects language preference 3. Chooses user type (Individual/Legal Entity) 4. Selects role (Carrier/Cargo Owner/etc.) 5. Fills profile information 6. Uploads required documents 7. Awaits verification (if required) ### Cargo Management Flow 1. Cargo owner creates cargo listing 2. System processes and validates cargo information 3. Students can view and manage cargo listings 4. Students can match cargo with carriers 5. Carriers receive notification and can accept/reject 6. System tracks cargo status throughout delivery ### Vehicle Management Flow 1. Carrier registers vehicles 2. Uploads required documentation 3. System verifies vehicle information 4. Carrier can update vehicle availability 5. System matches vehicles with compatible cargo 6. Tracks vehicle status and documents expiry ### Student Learning Flow 1. Student registers with group information 2. Gets assigned to mentor 3. Can view and practice with real cargo listings 4. Manages cargo-carrier matching 5. Receives feedback from mentors 6. Tracks learning progress ## 🔐 Security - JWT-based authentication - Role-based access control - Document verification system - Secure file uploads - HTTPS encryption - Input validation - Rate limiting - Session management ## 📱 Mobile Responsiveness The platform is fully responsive and optimized for: - Desktop browsers - Mobile devices - Telegram WebApp - Tablets ## 🌐 API Documentation API documentation is available at: - Swagger UI: `/api/docs/` - ReDoc: `/api/redoc/` ## 🤝 Contributing Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests. ## 📄 License This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details ## 👥 Team - Product Owner: [Name] - Lead Developer: [Name] - Backend Developer: [Name] - Frontend Developer: [Name] - UI/UX Designer: [Name] ## 📞 Support For support, please contact: - Email: support@logit.com - Telegram: @logit_support - Website: https://logit.com/support ## 🌟 Acknowledgments - Telegram for WebApp SDK - Shadcn for UI components - All contributors and testers ## 🗺 Roadmap ### Phase 1 (Current) - Core platform functionality - Basic cargo management - Vehicle registration - User authentication ### Phase 2 (Planned) - Advanced analytics - Mobile applications - Real-time tracking - Payment integration - AI-powered matching ### Phase 3 (Future) - International expansion - Blockchain integration - IoT device support - Advanced automation ## ⚙ Configuration ### Environment Variables #### Frontend \`\`\`env NEXT_PUBLIC_API_URL= NEXT_PUBLIC_TELEGRAM_BOT_TOKEN= \`\`\` #### Backend \`\`\`env DJANGO_SECRET_KEY= DJANGO_DEBUG= TELEGRAM_BOT_TOKEN= POSTGRES_DB= POSTGRES_USER= POSTGRES_PASSWORD= POSTGRES_HOST= POSTGRES_PORT= \`\`\` --- **Note**: This project is actively maintained and regularly updated. For the latest features and changes, please check the CHANGELOG.md file.
 ```
 
 # users\admin.py
@@ -5877,3 +7512,4 @@ class VehicleDocumentViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(document)
         return Response(serializer.data)
 ```
+

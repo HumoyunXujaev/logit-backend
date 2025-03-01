@@ -15,7 +15,115 @@ from .serializers import (
     SearchFilterUpdateSerializer
 )
 from .permissions import IsVerifiedUser, IsStaffOrReadOnly
- 
+from django.db.models import F, FloatField
+from django.db.models.functions import Power, Sqrt
+from django.contrib.postgres.search import SearchVector, SearchQuery
+from .models import Location
+from .serializers import (
+    LocationListSerializer,
+    LocationDetailSerializer,
+    LocationSearchSerializer
+)
+
+class LocationViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Location.objects.all()
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name']
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return LocationListSerializer
+        if self.action in ['nearest', 'search']:
+            return LocationSearchSerializer
+        return LocationDetailSerializer
+
+    @action(detail=False)
+    def countries(self, request):
+        """Get list of countries"""
+        countries = Location.objects.filter(level=1)
+        serializer = self.get_serializer(countries, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False)
+    def states(self, request):
+        """Get states/regions for a country"""
+        country_id = request.query_params.get('country_id')
+        if not country_id:
+            return Response({'error': 'country_id parameter is required'}, status=400)
+            
+        states = Location.objects.filter(
+            level=2,
+            country_id=country_id
+        )
+        serializer = self.get_serializer(states, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False)
+    def cities(self, request):
+        """Get cities for a state or country"""
+        state_id = request.query_params.get('state_id')
+        country_id = request.query_params.get('country_id')
+        
+        if not (state_id or country_id):
+            return Response(
+                {'error': 'Either state_id or country_id parameter is required'},
+                status=400
+            )
+            
+        cities = Location.objects.filter(level=3)
+        if state_id:
+            cities = cities.filter(parent_id=state_id)
+        elif country_id:
+            cities = cities.filter(country_id=country_id)
+            
+        serializer = self.get_serializer(cities, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False)
+    def nearest(self, request):
+        """Find locations within specified radius"""
+        try:
+            lat = float(request.query_params.get('lat', 0))
+            lon = float(request.query_params.get('lon', 0))
+            radius = float(request.query_params.get('radius', 100))  # km
+            level = int(request.query_params.get('level', 3))  # Default to cities
+        except (TypeError, ValueError):
+            return Response({'error': 'Invalid parameters'}, status=400)
+
+        # Calculate distances using the Haversine formula approximation
+        # This formula works well for PostgreSQL
+        locations = Location.objects.filter(level=level).annotate(
+            distance=Sqrt(
+                Power(69.1 * (F('latitude') - lat), 2) +
+                Power(69.1 * (F('longitude') - lon) * 0.73, 2)
+            ).annotate(distance=FloatField())
+        ).filter(distance__lte=radius).order_by('distance')
+
+        serializer = self.get_serializer(locations, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False)
+    def search(self, request):
+        """Search locations by name with full text search"""
+        query = request.query_params.get('q', '')
+        if not query:
+            return Response({'error': 'Search query is required'}, status=400)
+
+        locations = Location.objects.annotate(
+            search=SearchVector('name')
+        ).filter(search=SearchQuery(query))
+
+        serializer = self.get_serializer(locations, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True)
+    def children(self, request, pk=None):
+        """Get direct child locations"""
+        location = self.get_object()
+        children = Location.objects.filter(parent=location)
+        serializer = self.get_serializer(children, many=True)
+        return Response(serializer.data)
+    
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]

@@ -2,10 +2,48 @@ from rest_framework import serializers
 from django.contrib.contenttypes.models import ContentType
 from .models import (
     Notification, Favorite, Rating, TelegramGroup,
-    TelegramMessage, SearchFilter
+    TelegramMessage, SearchFilter, Location
 )
 from users.serializers import UserProfileSerializer
 
+class LocationListSerializer(serializers.ModelSerializer):
+    """Simple serializer for location lists"""
+    class Meta:
+        model = Location
+        fields = ['id', 'name', 'level', 'code']
+
+class LocationDetailSerializer(serializers.ModelSerializer):
+    """Detailed serializer with hierarchy information"""
+    parent_name = serializers.CharField(source='parent.name', read_only=True)
+    country_name = serializers.CharField(source='country.name', read_only=True)
+    hierarchy = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Location
+        fields = [
+            'id', 'name', 'level', 'code',
+            'parent_name', 'country_name',
+            'latitude', 'longitude',
+            'hierarchy', 'additional_data'
+        ]
+    
+    def get_hierarchy(self, obj):
+        return obj.get_hierarchy()
+
+class LocationSearchSerializer(serializers.ModelSerializer):
+    """Serializer for location search results"""
+    distance = serializers.FloatField(read_only=True)
+    full_name = serializers.CharField(read_only=True)
+    
+    class Meta:
+        model = Location
+        fields = [
+            'id', 'name', 'level',
+            'latitude', 'longitude',
+            'distance', 'full_name'
+        ]
+
+# Остальные существующие сериализаторы
 class NotificationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Notification

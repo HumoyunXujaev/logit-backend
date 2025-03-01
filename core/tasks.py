@@ -1,191 +1,90 @@
-import logging
 from celery import shared_task
-from django.db import transaction
 from django.utils import timezone
-from django.conf import settings
 from datetime import timedelta
-import telegram
-from .models import (
-    TelegramGroup, TelegramMessage,
-    Notification, SearchFilter
-)
-from cargo.models import Cargo
+from django.conf import settings
+from django.contrib.auth import get_user_model
+import logging
 
 logger = logging.getLogger(__name__)
-
-@shared_task
-def sync_telegram_groups():
-    """
-    Synchronize messages from Telegram groups
-    """
-    try:
-        bot = telegram.Bot(token=settings.TELEGRAM_BOT_TOKEN)
-        
-        for group in TelegramGroup.objects.filter(is_active=True):
-            try:
-                # Get updates from telegram
-                updates = bot.get_updates(offset=-1, timeout=30)
-                
-                for update in updates:
-                    if not update.message:
-                        continue
-                    
-                    # Skip if message already exists
-                    if TelegramMessage.objects.filter(
-                        telegram_id=str(update.message.message_id)
-                    ).exists():
-                        continue
-                    
-                    # Create new message
-                    TelegramMessage.objects.create(
-                        telegram_id=str(update.message.message_id),
-                        group=group,
-                        message_text=update.message.text
-                    )
-                
-                # Update last sync time
-                group.last_sync = timezone.now()
-                group.save()
-                
-            except Exception as e:
-                logger.error(
-                    f"Error syncing group {group.name}: {str(e)}"
-                )
-                continue
-            
-    except Exception as e:
-        logger.error(f"Error in sync_telegram_groups: {str(e)}")
-        raise
-
-@shared_task
-def process_telegram_messages():
-    """
-    Process unprocessed Telegram messages and create cargo entries
-    """
-    try:
-        messages = TelegramMessage.objects.filter(
-            processed=False
-        ).select_related('group')
-        
-        for message in messages:
-            try:
-                with transaction.atomic():
-                    # Extract cargo information from message
-                    cargo_data = parse_cargo_message(message.message_text)
-                    
-                    if cargo_data:
-                        # Create cargo entry
-                        cargo = Cargo.objects.create(
-                            source_type='telegram',
-                            source_id=message.telegram_id,
-                            **cargo_data
-                        )
-                        
-                        message.cargo = cargo
-                        message.processed = True
-                        message.processed_at = timezone.now()
-                        message.save()
-                        
-                        # Notify users with matching search filters
-                        notify_matching_users.delay(cargo.id)
-                    
-            except Exception as e:
-                logger.error(
-                    f"Error processing message {message.telegram_id}: {str(e)}"
-                )
-                continue
-                
-    except Exception as e:
-        logger.error(f"Error in process_telegram_messages: {str(e)}")
-        raise
-
-@shared_task
-def notify_matching_users(cargo_id):
-    """
-    Notify users with matching search filters about new cargo
-    """
-    try:
-        cargo = Cargo.objects.get(id=cargo_id)
-        
-        # Get all active search filters
-        filters = SearchFilter.objects.filter(
-            notifications_enabled=True
-        ).select_related('user')
-        
-        for filter_obj in filters:
-            try:
-                # Check if cargo matches filter criteria
-                if cargo_matches_filter(cargo, filter_obj.filter_data):
-                    # Create notification
-                    Notification.objects.create(
-                        user=filter_obj.user,
-                        type='cargo',
-                        message=f'New cargo matching your filter "{filter_obj.name}": {cargo.title}',
-                        content_object=cargo
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Error processing filter {filter_obj.id}: {str(e)}"
-                )
-                continue
-                
-    except Exception as e:
-        logger.error(f"Error in notify_matching_users: {str(e)}")
-        raise
+User = get_user_model()
 
 @shared_task
 def clean_old_notifications():
-    """
-    Remove notifications older than 30 days
-    """
-    try:
-        threshold = timezone.now() - timedelta(days=30)
-        Notification.objects.filter(created_at__lt=threshold).delete()
-    except Exception as e:
-        logger.error(f"Error in clean_old_notifications: {str(e)}")
-        raise
+    """Remove notifications older than 30 days"""
+    from core.models import Notification
+    
+    threshold = timezone.now() - timedelta(days=30)
+    deleted_count = Notification.objects.filter(created_at__lt=threshold).delete()[0]
+    
+    logger.info(f"Cleaned {deleted_count} old notifications")
 
 @shared_task
 def check_expired_cargos():
-    """
-    Check for expired cargo listings and notify owners
-    """
-    try:
-        threshold = timezone.now().date()
-        expired_cargos = Cargo.objects.filter(
-            status='active',
-            loading_date__lt=threshold
-        )
+    """Check for expired cargo listings and notify owners"""
+    from cargo.models import Cargo
+    from core.services.telegram import telegram_service
+    
+    threshold = timezone.now().date()
+    expired_cargos = Cargo.objects.filter(
+        status__in=['pending', 'manager_approved'],
+        loading_date__lt=threshold
+    )
+    
+    for cargo in expired_cargos:
+        # Update cargo status
+        cargo.status = Cargo.CargoStatus.EXPIRED
+        cargo.save()
         
-        for cargo in expired_cargos:
-            # Create notification for cargo owner
-            Notification.objects.create(
-                user=cargo.owner,
-                type='cargo',
-                message=f'Your cargo listing "{cargo.title}" has expired',
-                content_object=cargo
+        # Notify owner if they exist
+        if cargo.owner and cargo.owner.telegram_id:
+            message = f"""
+⚠️ <b>Груз просрочен</b>
+
+<b>Груз:</b> {cargo.title}
+<b>Маршрут:</b> {cargo.loading_point} ➡️ {cargo.unloading_point}
+<b>Дата загрузки:</b> {cargo.loading_date.strftime('%d.%m.%Y')}
+
+Статус груза изменен на "Просрочен".
+"""
+            telegram_service.send_notification.delay(
+                cargo.owner.telegram_id,
+                message
             )
-            
-            # Update cargo status
-            cargo.status = 'expired'
-            cargo.save()
-            
-    except Exception as e:
-        logger.error(f"Error in check_expired_cargos: {str(e)}")
-        raise
+    
+    logger.info(f"Marked {expired_cargos.count()} cargos as expired")
 
-def parse_cargo_message(message_text):
-    """
-    Parse cargo information from Telegram message
-    This is a placeholder - implement actual parsing logic
-    """
-    # TODO: Implement message parsing using NLP or pattern matching
-    return None
+@shared_task
+def check_expiring_documents():
+    """Check for vehicle documents that are about to expire and notify owners"""
+    from vehicles.models import VehicleDocument
+    from core.services.telegram import telegram_service
+    
+    # Check documents expiring in the next 7 days
+    soon = timezone.now().date() + timedelta(days=7)
+    expiring_docs = VehicleDocument.objects.filter(
+        expiry_date__lte=soon,
+        expiry_date__gte=timezone.now().date()
+    ).select_related('vehicle', 'vehicle__owner')
+    
+    for doc in expiring_docs:
+        owner = doc.vehicle.owner
+        if owner and owner.telegram_id:
+            days_left = (doc.expiry_date - timezone.now().date()).days
+            
+            message = f"""
+⚠️ <b>Скоро истекает срок действия документа</b>
 
-def cargo_matches_filter(cargo, filter_data):
-    """
-    Check if cargo matches filter criteria
-    This is a placeholder - implement actual matching logic
-    """
-    # TODO: Implement filter matching logic
-    return False
+<b>Транспорт:</b> {doc.vehicle.registration_number}
+<b>Документ:</b> {doc.get_type_display()}
+<b>Название:</b> {doc.title}
+<b>Срок действия:</b> {doc.expiry_date.strftime('%d.%m.%Y')}
+<b>Осталось дней:</b> {days_left}
+
+Пожалуйста, обновите документ до истечения срока.
+"""
+            telegram_service.send_notification.delay(
+                owner.telegram_id,
+                message
+            )
+    
+    logger.info(f"Sent notifications for {expiring_docs.count()} expiring documents")

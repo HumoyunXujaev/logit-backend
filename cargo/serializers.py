@@ -5,6 +5,8 @@ from users.serializers import UserProfileSerializer
 from .models import Cargo, CarrierRequest, CargoDocument
 from vehicles.serializers import VehicleSerializer
 from django.conf import settings
+from core.serializers import LocationListSerializer, LocationDetailSerializer
+from core.models import Location
 
 class CargoApprovalSerializer(serializers.ModelSerializer):
     """Serializer for manager approval/rejection of cargo"""
@@ -24,12 +26,24 @@ class CargoApprovalSerializer(serializers.ModelSerializer):
 
 class ManagerCargoUpdateSerializer(serializers.ModelSerializer):
     """Serializer for managers to update cargo details"""
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    
     class Meta:
         model = Cargo
         fields = [
             'title', 'description', 'weight',
             'volume', 'length', 'width', 'height',
             'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'additional_points', 'loading_date',
             'is_constant', 'is_ready', 'vehicle_type',
             'loading_type', 'payment_method', 'price',
@@ -60,6 +74,16 @@ class ExternalCargoCreateSerializer(serializers.ModelSerializer):
     api_key = serializers.CharField(write_only=True)
     source_type = serializers.ChoiceField(choices=Cargo.SourceType.choices)
     source_id = serializers.CharField(required=True)
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
 
     class Meta:
         model = Cargo
@@ -67,6 +91,7 @@ class ExternalCargoCreateSerializer(serializers.ModelSerializer):
             'title', 'description', 'weight',
             'volume', 'length', 'width', 'height',
             'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'additional_points', 'loading_date',
             'is_constant', 'is_ready', 'vehicle_type',
             'loading_type', 'payment_method', 'price',
@@ -123,12 +148,15 @@ class CarrierRequestSerializer(serializers.ModelSerializer):
     assigned_by = UserProfileSerializer(read_only=True)
     vehicle = VehicleSerializer(read_only=True)
     assigned_cargo = serializers.PrimaryKeyRelatedField(read_only=True)
+    loading_location = LocationDetailSerializer(read_only=True)
+    unloading_location = LocationDetailSerializer(read_only=True)
     
     class Meta:
         model = CarrierRequest
         fields = [
             'id', 'carrier', 'vehicle', 'loading_point',
-            'unloading_point', 'ready_date', 'vehicle_count',
+            'unloading_point', 'loading_location', 'unloading_location',
+            'ready_date', 'vehicle_count',
             'price_expectation', 'payment_terms', 'notes',
             'status', 'created_at', 'updated_at',
             'assigned_cargo', 'assigned_by', 'assigned_at'
@@ -137,10 +165,22 @@ class CarrierRequestSerializer(serializers.ModelSerializer):
 
 class CarrierRequestCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating carrier requests"""
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    
     class Meta:
         model = CarrierRequest
         fields = [
             'vehicle', 'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'ready_date', 'vehicle_count', 'price_expectation',
             'payment_terms', 'notes'
         ]
@@ -161,13 +201,37 @@ class CarrierRequestCreateSerializer(serializers.ModelSerializer):
                 "Ready date cannot be in the past"
             )
         return value
+    
+    def validate(self, data):
+        """Validate location data"""
+        # Если указан loading_location, но не указан loading_point
+        if data.get('loading_location') and not data.get('loading_point'):
+            data['loading_point'] = data['loading_location'].name
+            
+        # Если указан unloading_location, но не указан unloading_point
+        if data.get('unloading_location') and not data.get('unloading_point'):
+            data['unloading_point'] = data['unloading_location'].name
+            
+        return data
 
 class CarrierRequestUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating carrier requests"""
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    
     class Meta:
         model = CarrierRequest
         fields = [
             'vehicle', 'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'ready_date', 'vehicle_count', 'price_expectation',
             'payment_terms', 'notes', 'status'
         ]
@@ -192,17 +256,32 @@ class CarrierRequestUpdateSerializer(serializers.ModelSerializer):
                 )
                 
         return value
+    
+    def validate(self, data):
+        """Validate location data"""
+        # Если указан loading_location, но не указан loading_point
+        if data.get('loading_location') and not data.get('loading_point'):
+            data['loading_point'] = data['loading_location'].name
+            
+        # Если указан unloading_location, но не указан unloading_point
+        if data.get('unloading_location') and not data.get('unloading_point'):
+            data['unloading_point'] = data['unloading_location'].name
+            
+        return data
 
 class CarrierRequestListSerializer(serializers.ModelSerializer):
     """Simplified carrier request serializer for list views"""
     carrier = UserProfileSerializer(read_only=True)
     vehicle = VehicleSerializer(read_only=True)
+    loading_location = LocationListSerializer(read_only=True)
+    unloading_location = LocationListSerializer(read_only=True)
     
     class Meta:
         model = CarrierRequest
         fields = [
             'id', 'carrier', 'vehicle', 'loading_point',
-            'unloading_point', 'ready_date', 'vehicle_count',
+            'unloading_point', 'loading_location', 'unloading_location',
+            'ready_date', 'vehicle_count',
             'price_expectation', 'payment_terms', 'notes',
             'status', 'created_at', 'updated_at',
             'assigned_cargo', 'assigned_by', 'assigned_at'
@@ -214,13 +293,18 @@ class CargoSerializer(serializers.ModelSerializer):
     assigned_to = UserProfileSerializer(read_only=True)
     managed_by = UserProfileSerializer(read_only=True)
     carrier_requests = CarrierRequestListSerializer(many=True, read_only=True)
+    loading_location = LocationDetailSerializer(read_only=True)
+    unloading_location = LocationDetailSerializer(read_only=True)
+    additional_locations = LocationDetailSerializer(many=True, read_only=True)
 
     class Meta:
         model = Cargo
         fields = [
             'id', 'title', 'description', 'status',
             'weight', 'volume', 'length', 'width', 'height',
-            'loading_point', 'unloading_point', 'additional_points',
+            'loading_point', 'unloading_point', 
+            'loading_location', 'unloading_location', 
+            'additional_locations', 'additional_points',
             'loading_date', 'is_constant', 'is_ready',
             'vehicle_type', 'loading_type',
             'payment_method', 'price', 'payment_details',
@@ -235,12 +319,24 @@ class CargoSerializer(serializers.ModelSerializer):
 
 class CargoCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating cargos"""
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    
     class Meta:
         model = Cargo
         fields = [
             'title', 'description', 'weight',
             'volume', 'length', 'width', 'height',
             'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'additional_points', 'loading_date',
             'is_constant', 'is_ready', 'vehicle_type',
             'loading_type', 'payment_method', 'price',
@@ -255,44 +351,18 @@ class CargoCreateSerializer(serializers.ModelSerializer):
             )
         return value
     
-    # def create(self, validated_data):
-    #     """Create cargo with default status based on user role"""
-    #     user = self.context['request'].user
-    #     status = 'draft'
-        
-    #     # Set initial status based on user role
-    #     if user.role in ['cargo-owner', 'logistics-company']:
-    #         status = 'pending'  # Needs logist assignment
-    #     elif user.role == 'student':
-    #         status = 'pending'  # Ready for carrier assignment
-    #         validated_data['managed_by'] = user
+    def validate(self, data):
+        """Validate location data"""
+        # Если указан loading_location, но не указан loading_point
+        if data.get('loading_location') and not data.get('loading_point'):
+            data['loading_point'] = data['loading_location'].name
             
-    #     return Cargo.objects.create(
-    #         owner=user,
-    #         status=status,
-    #         **validated_data
-    #     )
-
-    # def create(self, validated_data):
-    #     """Create cargo with default status based on user role"""
-    #     user = self.context['request'].user
-        
-    #     # Set initial status based on user role
-    #     if user.role == 'cargo-owner':
-    #         status = 'draft'  # Needs manager approval
-    #     elif user.role == 'logistics-company':
-    #         status = 'pending'  # Goes directly to students
-    #     else:
-    #         status = 'draft'  # Default status
+        # Если указан unloading_location, но не указан unloading_point
+        if data.get('unloading_location') and not data.get('unloading_point'):
+            data['unloading_point'] = data['unloading_location'].name
             
-    #     print(validated_data)
-    #     print(user)
-    #     validated_data.pop('owner', None)
-    #     return Cargo.objects.create(
-    #         owner=user,
-    #         status=status,
-    #         **validated_data
-    #     )
+        return data
+    
     def create(self, validated_data):
         """Create cargo with appropriate initial status based on user role"""
         request = self.context.get('request')
@@ -315,16 +385,34 @@ class CargoCreateSerializer(serializers.ModelSerializer):
         else:
             validated_data['status'] = Cargo.CargoStatus.DRAFT
 
-        return super().create(validated_data)
+        # Create the cargo
+        print("creating cargo with data: ", validated_data)
+        cargo = Cargo.objects.create(
+            # owner=user, 
+            **validated_data)
+        
+        return cargo
     
 class CargoUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating cargo"""
+    loading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    unloading_location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.filter(level=3),
+        required=False,
+        allow_null=True
+    )
+    
     class Meta:
         model = Cargo
         fields = [
             'title', 'description', 'weight',
             'volume', 'length', 'width', 'height',
             'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
             'additional_points', 'loading_date',
             'is_constant', 'is_ready', 'vehicle_type',
             'loading_type', 'payment_method', 'price',
@@ -373,35 +461,43 @@ class CargoUpdateSerializer(serializers.ModelSerializer):
             )
 
         return value
+    
+    def validate(self, data):
+        """Validate location data"""
+        # Если указан loading_location, но не указан loading_point
+        if data.get('loading_location') and not data.get('loading_point'):
+            data['loading_point'] = data['loading_location'].name
+            
+        # Если указан unloading_location, но не указан unloading_point
+        if data.get('unloading_location') and not data.get('unloading_point'):
+            data['unloading_point'] = data['unloading_location'].name
+            
+        return data
 
 class CargoListSerializer(serializers.ModelSerializer):
     """Simplified cargo serializer for list views"""
     owner = UserProfileSerializer(read_only=True)
     assigned_to = UserProfileSerializer(read_only=True)
     managed_by = UserProfileSerializer(read_only=True)
-    carrier_requests = CarrierRequestListSerializer(many=True, read_only=True)
+    loading_location = LocationListSerializer(read_only=True)
+    unloading_location = LocationListSerializer(read_only=True)
 
     class Meta:
         model = Cargo
         fields = [
-            # 'id', 'title', 'status', 'weight',
-            # 'loading_point', 'unloading_point',
-            # 'loading_date', 'vehicle_type',
-            # 'payment_method', 'price', 'owner',
-            # 'assigned_to', 'managed_by', 'created_at'
             'id', 'title', 'description', 'status',
             'weight', 'volume', 'length', 'width', 'height',
-            'loading_point', 'unloading_point', 'additional_points',
-            'loading_date', 'is_constant', 'is_ready',
+            'loading_point', 'unloading_point',
+            'loading_location', 'unloading_location',
+            'additional_points', 'loading_date', 'is_constant', 'is_ready',
             'vehicle_type', 'loading_type',
             'payment_method', 'price', 'payment_details',
             'owner', 'assigned_to', 'managed_by',
             'created_at', 'updated_at', 'views_count',
-            'source_type', 'source_id', 'carrier_requests'
+            'source_type', 'source_id'
         ]
         read_only_fields = [
-            'created_at', 'updated_at', 'views_count',
-            'carrier_requests'
+            'created_at', 'updated_at', 'views_count'
         ]
 
 class CargoAssignmentSerializer(serializers.ModelSerializer):
@@ -492,48 +588,51 @@ class CargoAcceptanceSerializer(serializers.ModelSerializer):
 
         return instance
 
-# class CargoSearchSerializer(serializers.Serializer):
-#     """Serializer for cargo search parameters"""
-#     q = serializers.CharField(required=False, allow_blank=True)
-#     from_location = serializers.CharField(required=False)
-#     to_location = serializers.CharField(required=False)
-#     min_weight = serializers.DecimalField(
-#         required=False,
-#         max_digits=10,
-#         decimal_places=2
-#     )
-#     max_weight = serializers.DecimalField(
-#         required=False,
-#         max_digits=10,
-#         decimal_places=2
-#     )
-#     date_from = serializers.DateField(required=False)
-#     date_to = serializers.DateField(required=False)
-#     vehicle_types = serializers.MultipleChoiceField(
-#         required=False,
-#         choices=Cargo.VehicleType.choices
-#     )
-#     loading_types = serializers.MultipleChoiceField(
-#         required=False,
-#         choices=Cargo.LoadingType.choices
-#     )
-#     payment_methods = serializers.MultipleChoiceField(
-#         required=False,
-#         choices=Cargo.PaymentMethod.choices
-#     )
+class CargoSearchSerializer(serializers.Serializer):
+    """Serializer for cargo search parameters"""
+    q = serializers.CharField(required=False, allow_blank=True)
+    from_location_id = serializers.IntegerField(required=False)
+    to_location_id = serializers.IntegerField(required=False)
+    from_location = serializers.CharField(required=False, allow_blank=True)
+    to_location = serializers.CharField(required=False, allow_blank=True)
+    min_weight = serializers.DecimalField(
+        required=False,
+        max_digits=10,
+        decimal_places=2
+    )
+    max_weight = serializers.DecimalField(
+        required=False,
+        max_digits=10,
+        decimal_places=2
+    )
+    date_from = serializers.DateField(required=False)
+    date_to = serializers.DateField(required=False)
+    vehicle_types = serializers.MultipleChoiceField(
+        required=False,
+        choices=Cargo.VehicleType.choices
+    )
+    loading_types = serializers.MultipleChoiceField(
+        required=False,
+        choices=Cargo.LoadingType.choices
+    )
+    payment_methods = serializers.MultipleChoiceField(
+        required=False,
+        choices=Cargo.PaymentMethod.choices
+    )
+    radius = serializers.IntegerField(required=False, min_value=0, max_value=500)
     
-#     def validate(self, data):
-#         """Validate search parameters"""
-#         if data.get('min_weight') and data.get('max_weight'):
-#             if data['min_weight'] > data['max_weight']:
-#                 raise serializers.ValidationError(
-#                     "min_weight cannot be greater than max_weight"
-#                 )
+    def validate(self, data):
+        """Validate search parameters"""
+        if data.get('min_weight') and data.get('max_weight'):
+            if data['min_weight'] > data['max_weight']:
+                raise serializers.ValidationError(
+                    "min_weight cannot be greater than max_weight"
+                )
         
-#         if data.get('date_from') and data.get('date_to'):
-#             if data['date_from'] > data['date_to']:
-#                 raise serializers.ValidationError(
-#                     "date_from cannot be later than date_to"
-#                 )
+        if data.get('date_from') and data.get('date_to'):
+            if data['date_from'] > data['date_to']:
+                raise serializers.ValidationError(
+                    "date_from cannot be later than date_to"
+                )
         
-#         return data
+        return data

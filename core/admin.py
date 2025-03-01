@@ -6,8 +6,42 @@ from .models import (
     Rating,
     TelegramGroup,
     TelegramMessage,
-    SearchFilter
+    SearchFilter,
+    Location
 )
+
+
+
+@admin.register(Location)
+class LocationAdmin(admin.ModelAdmin):
+    list_display = (
+        'name', 'level', 'latitude',
+        'longitude', 'code', 'created_at'
+    )
+    list_filter = ('level', 'created_at')
+    search_fields = ('name', 'code')
+    ordering = ('name',)
+    raw_id_fields = ('parent', 'country')
+    readonly_fields = ('created_at', 'updated_at')
+    fieldsets = (
+        (None, {
+            'fields': (
+                'name', 'level', 'latitude',
+                'longitude', 'code', 'additional_data'
+            )
+        }),
+        (_('Hierarchy'), {
+            'fields': ('parent', 'country'),
+            'classes': ('collapse',)
+        }),
+        (_('Timestamps'), {
+            'fields': ('created_at', 'updated_at'),
+            'classes': ('collapse',)
+        })
+    )
+
+
+
 
 @admin.register(Notification)
 class NotificationAdmin(admin.ModelAdmin):

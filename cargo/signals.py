@@ -1,85 +1,197 @@
-from django.db.models.signals import post_save
+from django.db.models.signals import post_save, post_delete, pre_save
 from django.dispatch import receiver
 from django.contrib.auth import get_user_model
 from .models import Cargo, CarrierRequest
 from core.services.telegram import telegram_service
-import asyncio
+from django.db import transaction
 
 User = get_user_model()
 
 @receiver(post_save, sender=Cargo)
-def notify_cargo_status_change(sender, instance, created, **kwargs):
-    """Send notifications for cargo status changes"""
-    if created:
+def notify_cargo_changes(sender, instance, created, **kwargs):
+    """Send notifications for cargo creation and changes"""
+    # Skip if this is not a change or the transaction is being managed elsewhere
+    if transaction.get_connection().in_atomic_block and not created:
         return
         
-    if instance.tracker.has_changed('status'):
-        old_status = instance.tracker.previous('status')
+    # Determine action and recipients based on status and event
+    if created:
+        action = f"Новый груз создан: {instance.title}"
+        
+        # Notify different users based on cargo status
+        if instance.status == Cargo.CargoStatus.PENDING_APPROVAL:
+            # Notify managers about new cargo requiring approval
+            managers = User.objects.filter(role='manager', is_active=True)
+            if managers.exists():
+                for manager in managers:
+                    if manager.telegram_id:
+                        telegram_service.send_notification.delay(
+                            manager.telegram_id,
+                            telegram_service.format_cargo_notification(instance, action)
+                        )
+            
+        elif instance.status == Cargo.CargoStatus.PENDING:
+            # Notify students about new cargo
+            students = User.objects.filter(role='student', is_active=True)
+            if students.exists():
+                for student in students:
+                    if student.telegram_id:
+                        telegram_service.send_notification.delay(
+                            student.telegram_id, 
+                            telegram_service.format_cargo_notification(instance, action)
+                        )
+            
+    elif hasattr(instance, '_original_status') and instance._original_status != instance.status:
+        old_status = instance._original_status
         new_status = instance.status
         
-        # Determine who should be notified
-        recipients = []
-        action = ""
+        action = f"Статус груза изменен с {old_status} на {new_status}: {instance.title}"
         
-        if new_status == 'pending_approval':
-            # Notify managers
-            recipients = User.objects.filter(
-                role='manager',
-                is_active=True,
-                telegram_id__isnull=False
+        # Notify owner
+        if instance.owner and instance.owner.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.owner.telegram_id,
+                telegram_service.format_cargo_notification(instance, action)
             )
-            action = f"Новый груз требует проверки: {instance.title}"
             
-        elif new_status == 'manager_approved':
-            # Notify students
-            recipients = User.objects.filter(
-                role='student',
-                is_active=True,
-                telegram_id__isnull=False
+        # Notify assigned carrier if status becomes assigned
+        if new_status == Cargo.CargoStatus.ASSIGNED and instance.assigned_to and instance.assigned_to.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.assigned_to.telegram_id,
+                telegram_service.format_cargo_notification(instance, "Вам назначен груз")
             )
-            action = f"Новый груз доступен: {instance.title}"
             
-        elif new_status == 'assigned':
-            # Notify carrier
-            if instance.assigned_to and instance.assigned_to.telegram_id:
-                recipients = [instance.assigned_to]
-                action = f"Вам назначен груз: {instance.title}"
+        # Notify managing student about status changes
+        if instance.managed_by and instance.managed_by.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.managed_by.telegram_id,
+                telegram_service.format_cargo_notification(instance, action)
+            )
+            
+        # Notify all students when cargo becomes manager_approved
+        if new_status == Cargo.CargoStatus.MANAGER_APPROVED:
+            students = User.objects.filter(role='student', is_active=True)
+            if students.exists():
+                for student in students:
+                    if student.telegram_id:
+                        telegram_service.send_notification.delay(
+                            student.telegram_id,
+                            telegram_service.format_cargo_notification(instance, "Новый груз доступен")
+                        )
 
-        # Send notifications via Telegram
-        if recipients and action:
-            messages = [
-                (user.telegram_id, telegram_service.format_cargo_notification(instance, action))
-                for user in recipients
-            ]
-            asyncio.create_task(telegram_service.send_bulk_messages(messages))
+@receiver(pre_save, sender=Cargo)
+def store_original_status(sender, instance, **kwargs):
+    """Store original status before save for comparison in post_save"""
+    if instance.pk:
+        try:
+            instance._original_status = Cargo.objects.get(pk=instance.pk).status
+        except Cargo.DoesNotExist:
+            instance._original_status = None
+    else:
+        instance._original_status = None
+
+@receiver(post_delete, sender=Cargo)
+def notify_cargo_deletion(sender, instance, **kwargs):
+    """Send notifications when cargo is deleted"""
+    action = f"Груз удален: {instance.title}"
+    
+    # Notify owner
+    if instance.owner and instance.owner.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.owner.telegram_id, 
+            telegram_service.format_cargo_notification(instance, action)
+        )
+    
+    # Notify carrier if assigned
+    if instance.assigned_to and instance.assigned_to.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.assigned_to.telegram_id,
+            telegram_service.format_cargo_notification(instance, action)
+        )
+    
+    # Notify managing student
+    if instance.managed_by and instance.managed_by.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.managed_by.telegram_id,
+            telegram_service.format_cargo_notification(instance, action)
+        )
 
 @receiver(post_save, sender=CarrierRequest)
-def notify_carrier_request_status_change(sender, instance, created, **kwargs):
-    """Send notifications for carrier request status changes"""
+def notify_carrier_request_changes(sender, instance, created, **kwargs):
+    """Send notifications for carrier request creation and changes"""
     if created:
-        return
+        action = "Новая заявка от перевозчика"
         
-    if instance.tracker.has_changed('status'):
-        old_status = instance.tracker.previous('status')
+        # Notify students about new carrier request
+        students = User.objects.filter(role='student', is_active=True)
+        if students.exists():
+            for student in students:
+                if student.telegram_id:
+                    telegram_service.send_notification.delay(
+                        student.telegram_id,
+                        telegram_service.format_carrier_notification(instance, action)
+                    )
+            
+    elif hasattr(instance, '_original_status') and instance._original_status != instance.status:
+        old_status = instance._original_status
         new_status = instance.status
         
-        recipients = []
-        action = ""
+        action = f"Статус заявки изменен с {old_status} на {new_status}"
         
-        if new_status == 'assigned':
-            if instance.carrier and instance.carrier.telegram_id:
-                recipients = [instance.carrier]
-                action = "Вашей заявке назначен груз"
+        # Notify carrier about status changes
+        if instance.carrier and instance.carrier.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.carrier.telegram_id,
+                telegram_service.format_carrier_notification(instance, action)
+            )
+            
+        # Notify assigning student if request was assigned
+        if instance.assigned_by and instance.assigned_by.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.assigned_by.telegram_id,
+                telegram_service.format_carrier_notification(instance, action)
+            )
                 
-        elif new_status in ['accepted', 'rejected']:
-            if instance.assigned_by and instance.assigned_by.telegram_id:
-                recipients = [instance.assigned_by]
-                action = f"Перевозчик {'принял' if new_status == 'accepted' else 'отклонил'} назначенный груз"
+        # Notify cargo owner if request was accepted
+        if new_status == CarrierRequest.RequestStatus.ACCEPTED and instance.assigned_cargo and instance.assigned_cargo.owner and instance.assigned_cargo.owner.telegram_id:
+            telegram_service.send_notification.delay(
+                instance.assigned_cargo.owner.telegram_id,
+                telegram_service.format_carrier_notification(instance, "Перевозчик принял вашу заявку")
+            )
 
-        # Send notifications via Telegram
-        if recipients and action:
-            messages = [
-                (user.telegram_id, telegram_service.format_carrier_notification(instance, action))
-                for user in recipients
-            ]
-            asyncio.create_task(telegram_service.send_bulk_messages(messages))
+@receiver(pre_save, sender=CarrierRequest)
+def store_carrier_request_original_status(sender, instance, **kwargs):
+    """Store original status before save for comparison in post_save"""
+    if instance.pk:
+        try:
+            instance._original_status = CarrierRequest.objects.get(pk=instance.pk).status
+        except CarrierRequest.DoesNotExist:
+            instance._original_status = None
+    else:
+        instance._original_status = None
+
+@receiver(post_delete, sender=CarrierRequest)
+def notify_carrier_request_deletion(sender, instance, **kwargs):
+    """Send notifications when carrier request is deleted"""
+    action = f"Заявка перевозчика удалена"
+    
+    # Notify carrier
+    if instance.carrier and instance.carrier.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.carrier.telegram_id,
+            telegram_service.format_carrier_notification(instance, action)
+        )
+    
+    # Notify assigning student
+    if instance.assigned_by and instance.assigned_by.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.assigned_by.telegram_id,
+            telegram_service.format_carrier_notification(instance, action)
+        )
+    
+    # Notify cargo owner if request was assigned to a cargo
+    if instance.assigned_cargo and instance.assigned_cargo.owner and instance.assigned_cargo.owner.telegram_id:
+        telegram_service.send_notification.delay(
+            instance.assigned_cargo.owner.telegram_id,
+            telegram_service.format_carrier_notification(instance, action)
+        )

@@ -6,7 +6,8 @@ from .views import (
     RatingViewSet,
     TelegramGroupViewSet,
     TelegramMessageViewSet,
-    SearchFilterViewSet
+    SearchFilterViewSet,
+    LocationViewSet
 )
 
 router = DefaultRouter()
@@ -16,6 +17,7 @@ router.register(r'ratings', RatingViewSet, basename='rating')
 router.register(r'telegram-groups', TelegramGroupViewSet)
 router.register(r'telegram-messages', TelegramMessageViewSet)
 router.register(r'search-filters', SearchFilterViewSet, basename='search-filter')
+router.register(r'locations', LocationViewSet, basename='location')
 
 urlpatterns = [
     path('', include(router.urls)),

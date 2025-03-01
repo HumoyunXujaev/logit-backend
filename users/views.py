@@ -219,6 +219,22 @@ class UserViewSet(viewsets.GenericViewSet):
         documents = UserDocument.objects.filter(user=request.user)
         serializer = UserDocumentSerializer(documents, many=True)
         return Response(serializer.data)
+    
+
+    # delete document endpoint
+    @extend_schema(
+        description='Delete user document',
+        parameters=[OpenApiParameter(name='document_id', type=int)],
+        responses={200: {'description': 'Document deleted successfully'}}
+    )
+    @action(detail=False, methods=['delete'], url_path='documents/(?P<document_id>[^/.]+)')
+    def delete_document(self, request, document_id=None):
+        """Delete a user document"""
+        document = UserDocument.objects.get(id=document_id)
+        document.delete()
+        
+        return Response({'detail': 'Document deleted successfully'})
+
 
     @extend_schema(
         description='Verify user',

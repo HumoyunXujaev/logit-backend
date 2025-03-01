@@ -1,130 +1,102 @@
+from typing import List, Dict, Any, Tuple, Union
 import logging
-from typing import List, Optional
-from telegram.ext import Application
-from telegram import Bot
+import requests
 from django.conf import settings
-from django.core.cache import cache
-from concurrent.futures import ThreadPoolExecutor
-import telegram.error
-from users.models import User
-from cargo.models import Cargo, CarrierRequest
+from celery import shared_task
 
 logger = logging.getLogger(__name__)
 
 class TelegramNotificationService:
     def __init__(self):
         self.token = settings.TELEGRAM_BOT_TOKEN
-        self.executor = ThreadPoolExecutor(max_workers=4)
-        
-    def _send_message_sync(
-        self,
-        chat_id: str,
-        message: str,
-        silent: bool = False
-    ) -> bool:
-        """Send message synchronously using python-telegram-bot"""
-        try:
-            bot = Bot(token=self.token)
-            bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                parse_mode='HTML',
-                disable_notification=silent
-            )
-            return True
-        except telegram.error.TelegramError as e:
-            logger.error(f"Failed to send Telegram message to {chat_id}: {str(e)}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error sending message to {chat_id}: {str(e)}")
-            return False
+        self.api_url = f"https://api.telegram.org/bot{self.token}"
 
-    def send_message(
-        self,
-        chat_id: str,
-        message: str,
-        silent: bool = False
-    ) -> bool:
-        """Send message using thread pool"""
+    def send_message(self, chat_id: str, message: str) -> bool:
+        """Send message to a telegram chat"""
         try:
-            future = self.executor.submit(
-                self._send_message_sync,
-                chat_id,
-                message,
-                silent
+            response = requests.post(
+                f"{self.api_url}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": "HTML"
+                }
             )
-            return future.result(timeout=10)  # 10 second timeout
-        except Exception as e:
-            logger.error(f"Error in send_message thread: {str(e)}")
-            return False
-
-    def send_bulk_messages(
-        self,
-        messages: List[tuple[str, str]],
-        rate_limit: int = 30
-    ) -> None:
-        """Send multiple messages with rate limiting"""
-        from time import sleep
-        
-        for chat_id, message in messages:
-            # Rate limit: max 30 messages per second
-            if not cache.add(f'telegram_ratelimit_{chat_id}', 1, timeout=1):
-                sleep(1 / rate_limit)
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to send Telegram message: {response.text}")
+                return False
                 
-            self.send_message(chat_id, message)
+            return True
+        except Exception as e:
+            logger.error(f"Error sending Telegram message: {str(e)}")
+            return False
 
-    def format_cargo_notification(self, cargo: 'Cargo', action: str) -> str:
-        """Format cargo notification message"""
+    @staticmethod
+    @shared_task
+    def send_notification(telegram_id: str, message: str) -> bool:
+        """Celery task to send notification to a user"""
+        service = TelegramNotificationService()
+        return service.send_message(telegram_id, message)
+
+    @staticmethod
+    @shared_task
+    def send_bulk_messages(messages: List[Union[Dict[str, str], Tuple[str, str]]]) -> None:
+        """Send multiple messages via Celery"""
+        service = TelegramNotificationService()
+        for msg in messages:
+            # Handle both dict and tuple formats
+            if isinstance(msg, dict):
+                telegram_id = msg.get("telegram_id")
+                message = msg.get("message")
+            elif isinstance(msg, tuple) and len(msg) >= 2:
+                telegram_id, message = msg[0], msg[1]
+            else:
+                logger.error(f"Invalid message format: {msg}")
+                continue
+                
+            if telegram_id and message:
+                service.send_message(telegram_id, message)
+
+    def format_cargo_notification(self, cargo: Any, action: str) -> str:
+        """Format a cargo notification message"""
         return f"""
-🚛 <b>Уведомление о грузе</b>
-
-{action}
+🚛 <b>{action}</b>
 
 <b>Груз:</b> {cargo.title}
 <b>Маршрут:</b> {cargo.loading_point} ➡️ {cargo.unloading_point}
 <b>Вес:</b> {cargo.weight} т
-{f'<b>Объем:</b> {cargo.volume} м³' if cargo.volume else ''}
 <b>Тип транспорта:</b> {cargo.get_vehicle_type_display()}
-<b>Оплата:</b> {cargo.get_payment_method_display()}
-{f'<b>Цена:</b> {cargo.price} ₽' if cargo.price else ''}
+<b>Статус:</b> {cargo.get_status_display()}
 
 👉 Перейдите в приложение для подробностей
 """
 
-    def format_carrier_notification(
-        self,
-        carrier_request: 'CarrierRequest',
-        action: str
-    ) -> str:
-        """Format carrier request notification message"""
+    def format_carrier_notification(self, request: Any, action: str) -> str:
+        """Format a carrier request notification message"""
         return f"""
-🚚 <b>Уведомление о заявке перевозчика</b>
+🚚 <b>{action}</b>
 
-{action}
-
-<b>Перевозчик:</b> {carrier_request.carrier.get_full_name()}
-<b>Транспорт:</b> {carrier_request.vehicle.registration_number}
-<b>Маршрут:</b> {carrier_request.loading_point} ➡️ {carrier_request.unloading_point}
-<b>Дата готовности:</b> {carrier_request.ready_date.strftime('%d.%m.%Y')}
+<b>Перевозчик:</b> {request.carrier.get_full_name()}
+<b>Транспорт:</b> {request.vehicle.registration_number}
+<b>Маршрут:</b> {request.loading_point} ➡️ {request.unloading_point}
+<b>Статус:</b> {request.get_status_display()}
 
 👉 Перейдите в приложение для подробностей
 """
 
-    def format_verification_notification(
-        self,
-        user: 'User',
-        action: str
-    ) -> str:
-        """Format verification notification message"""
-        return f"""
-✅ <b>Уведомление о верификации</b>
+    def notify_users(self, recipients: List[Any], message: str) -> None:
+        """Send notification to multiple users"""
+        # Create list of (telegram_id, message) tuples for users with telegram_id
+        messages = [
+            (user.telegram_id, message)
+            for user in recipients
+            if user.telegram_id
+        ]
+        
+        # Send messages if we have any recipients
+        if messages:
+            self.send_bulk_messages.delay(messages)
 
-{action}
-
-<b>Пользователь:</b> {user.get_full_name()}
-<b>Статус:</b> {'Верифицирован' if user.is_verified else 'Ожидает проверки'}
-
-👉 Перейдите в приложение для подробностей
-"""
 
 telegram_service = TelegramNotificationService()

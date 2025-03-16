@@ -110,7 +110,7 @@ class RatingCreateSerializer(serializers.ModelSerializer):
     
     def create(self, validated_data):
         from_user = self.context['request'].user
-        return Rating.objects.create(from_user=from_user, **validated_data)
+        return Rating.objects.create(**validated_data)
 
 class TelegramGroupSerializer(serializers.ModelSerializer):
     class Meta:

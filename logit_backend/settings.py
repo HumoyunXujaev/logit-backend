@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'your-secret-key-for-development')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv('DJANGO_DEBUG', 'True') == 'True'
+DEBUG = os.getenv('DJANGO_DEBUG', 'False') == 'True'
 PRIVATE_API_KEY = os.getenv('PRIVATE_API_KEY', 'testp')
 EXTERNAL_API_KEY = os.getenv('EXTERNAL_API_KEY', 'testpb')
 

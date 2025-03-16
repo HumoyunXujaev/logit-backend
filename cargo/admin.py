@@ -15,7 +15,7 @@ class CarrierRequestAdmin(admin.ModelAdmin):
         'carrier__username', 'vehicle__registration_number',
         'loading_point', 'unloading_point'
     )
-    raw_id_fields = ['carrier', 'vehicle']
+    raw_id_fields = ['carrier', 'vehicle', 'loading_location', 'unloading_location']
     ordering = ['-created_at']
 
 

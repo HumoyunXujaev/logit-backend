@@ -18,7 +18,7 @@ class CarrierRequestAdmin(admin.ModelAdmin):
         'carrier__username', 'vehicle__registration_number',
         'loading_point', 'unloading_point'
     )
-    raw_id_fields = ['carrier', 'vehicle']
+    raw_id_fields = ['carrier', 'vehicle', 'loading_location', 'unloading_location']
     ordering = ['-created_at']
 
 
@@ -1985,6 +1985,12 @@ import hashlib
 from drf_spectacular.types import OpenApiTypes
 from django.conf import settings
 from rest_framework.permissions import AllowAny
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+
 
 class ManagerCargoViewSet(viewsets.ModelViewSet):
     """ViewSet for manager operations on cargo"""
@@ -2510,6 +2516,16 @@ class CargoViewSet(viewsets.ModelViewSet):
                 description='Unloading point'
             ),
             OpenApiParameter(
+                name='loading_location_id',
+                type=int,
+                description='Loading location ID'
+            ),
+            OpenApiParameter(
+                name='unloading_location_id',
+                type=int,
+                description='Unloading location ID'
+            ),
+            OpenApiParameter(
                 name='date_from',
                 type=str,
                 description='Loading date from'
@@ -2523,6 +2539,11 @@ class CargoViewSet(viewsets.ModelViewSet):
                 name='vehicle_type',
                 type=str,
                 description='Vehicle type'
+            ),
+            OpenApiParameter(
+                name='radius',
+                type=int,
+                description='Search radius in kilometers'
             ),
         ],
         responses={200: CargoListSerializer(many=True)}
@@ -2540,7 +2561,80 @@ class CargoViewSet(viewsets.ModelViewSet):
                 Q(description__icontains=q)
             )
         
-        # Filter by location
+        # Get radius parameter
+        radius = request.query_params.get('radius', None)
+        if radius:
+            try:
+                radius = int(radius)
+            except (ValueError, TypeError):
+                radius = None
+        
+        # Filter by location ID with radius support
+        loading_location_id = request.query_params.get('loading_location_id', '')
+        if loading_location_id:
+            try:
+                from core.models import Location
+                from django.db.models import Q
+                
+                # Проверяем, существует ли локация
+                location = Location.objects.filter(id=loading_location_id).first()
+                
+                if location and radius and location.latitude and location.longitude:
+                    # Get all locations within radius
+                    from core.services.location import LocationService
+                    locations_in_radius = LocationService.find_locations_in_radius(
+                        float(location.latitude),
+                        float(location.longitude),
+                        radius
+                    )
+                    location_ids = [loc['id'] for loc in locations_in_radius]
+                    
+                    if location_ids:
+                        queryset = queryset.filter(
+                            Q(loading_location__in=location_ids) |
+                            Q(loading_location=location.id)
+                        )
+                else:
+                    # Direct location match
+                    queryset = queryset.filter(loading_location=loading_location_id)
+            except Exception as e:
+                logger.error(f"Error in loading_location search: {str(e)}")
+                # Fallback to text search if location not found or error occurs
+                pass
+        
+        unloading_location_id = request.query_params.get('unloading_location_id', '')
+        if unloading_location_id:
+            try:
+                from core.models import Location
+                from django.db.models import Q
+                
+                # Проверяем, существует ли локация
+                location = Location.objects.filter(id=unloading_location_id).first()
+                
+                if location and radius and location.latitude and location.longitude:
+                    # Get all locations within radius
+                    from core.services.location import LocationService
+                    locations_in_radius = LocationService.find_locations_in_radius(
+                        float(location.latitude),
+                        float(location.longitude),
+                        radius
+                    )
+                    location_ids = [loc['id'] for loc in locations_in_radius]
+                    
+                    if location_ids:
+                        queryset = queryset.filter(
+                            Q(unloading_location__in=location_ids) |
+                            Q(unloading_location=location.id)
+                        )
+                else:
+                    # Direct location match
+                    queryset = queryset.filter(unloading_location=unloading_location_id)
+            except Exception as e:
+                logger.error(f"Error in unloading_location search: {str(e)}")
+                # Fallback to text search if location not found or error occurs
+                pass
+        
+        # Filter by text location (for backward compatibility)
         from_location = request.query_params.get('from_location', '')
         if from_location:
             queryset = queryset.filter(
@@ -2577,6 +2671,7 @@ class CargoViewSet(viewsets.ModelViewSet):
             
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+
 
     @extend_schema(
         description='Get cargo statistics',
@@ -4014,7 +4109,7 @@ class RatingCreateSerializer(serializers.ModelSerializer):
     
     def create(self, validated_data):
         from_user = self.context['request'].user
-        return Rating.objects.create(from_user=from_user, **validated_data)
+        return Rating.objects.create(**validated_data)
 
 class TelegramGroupSerializer(serializers.ModelSerializer):
     class Meta:
@@ -4851,6 +4946,18 @@ class SearchFilterViewSet(viewsets.ModelViewSet):
         })
 ```
 
+# gunicorn_config.py
+
+```py
+import multiprocessing
+
+bind = "127.0.0.1:8000"
+workers = multiprocessing.cpu_count() * 2 + 1
+max_requests = 1000
+max_requests_jitter = 50
+timeout = 30
+```
+
 # logit_backend\asgi.py
 
 ```py
@@ -5140,7 +5247,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'your-secret-key-for-development')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv('DJANGO_DEBUG', 'True') == 'True'
+DEBUG = os.getenv('DJANGO_DEBUG', 'False') == 'True'
 PRIVATE_API_KEY = os.getenv('PRIVATE_API_KEY', 'testp')
 EXTERNAL_API_KEY = os.getenv('EXTERNAL_API_KEY', 'testpb')
 
@@ -5470,6 +5577,14 @@ if __name__ == '__main__':
 
 ```
 
+# media\user_documents\стпдасс.webp
+
+This is a binary file of the type: Image
+
+# media\user_documents\wavy-black-white-background_rWA3uMq.jpg
+
+This is a binary file of the type: Image
+
 # media\user_documents\wavy-black-white-background.jpg
 
 This is a binary file of the type: Image
@@ -5488,6 +5603,12 @@ This is a binary file of the type: Image
 # Logit Platform - Logistics Management System ![Logit Platform](logit\app\blue.png) for local development u can do ts in order to not install postgres \`\`\` DATABASES = { 'default': { 'ENGINE': 'django.db.backends.sqlite3', 'NAME': BASE_DIR / 'db.sqlite3', } } \`\`\` ## Overview Logit Platform is a comprehensive logistics management system designed to streamline cargo transportation and logistics operations. The platform connects cargo owners, carriers, logistics companies, and logistics students in a unified ecosystem. ## 🌟 Key Features ### Authentication & User Management - Telegram WebApp authentication integration - Multi-role user system (Carriers, Cargo Owners, Logistics Companies, Students) - Profile management with document verification - Role-based access control - Language selection (Russian/Uzbek) ### Cargo Management - Create and manage cargo listings - Advanced cargo search with filtering - Real-time cargo status tracking - Multi-point route support - Automatic cargo matching with carriers - Price negotiation system - Document management for cargo ### Vehicle Management - Detailed vehicle registration and management - Vehicle document verification - Technical specifications tracking - Vehicle availability management - ADR/TIR/DOZVOL certification support - Vehicle inspection history ### Carrier Features - Vehicle fleet management - Cargo acceptance/rejection system - Real-time cargo notifications - Document upload and verification - Route planning and tracking - Availability management ### Student Features - Access to logistics training - Supervised cargo management - Learning progression tracking - Practice with real cargo listings - Mentor assignment system ### Platform Features - Real-time notifications - Favorites system - Rating and review system - Distance calculation - Advanced search filters - Document verification system - Multi-language support - Telegram group integration ## 🔧 Technology Stack ### Frontend - Next.js 14 (App Router) - TypeScript - TailwindCSS - Shadcn/ui Components - Telegram WebApp SDK - React Query - Axios - Framer Motion ### Backend - Django - Django REST Framework - PostgreSQL - Redis - Celery - JWT Authentication - Swagger/OpenAPI ## 📦 Installation ### Prerequisites - Node.js 18+ - Python 3.10+ - PostgreSQL - Redis - Telegram Bot Token ### Frontend Setup 1. Clone the repository: \`\`\`bash git clone https://github.com/HumoyunXujaev/logit-fronttt cd logit \`\`\` 2. Install dependencies: \`\`\`bash npm install \`\`\` 3. Create .env.local: \`\`\`env NEXT_PUBLIC_API_URL=http://localhost:8000/api NEXT_PUBLIC_TELEGRAM_BOT_TOKEN=your_telegram_bot_token \`\`\` 4. Run development server: \`\`\`bash npm run dev \`\`\` 5. setup ngrok (telegram web app doesn't work with localhost): \`\`\`bash ngrok http 3000 \`\`\` ### Backend Setup 1. Clone the repository: \`\`\`bash git clone https://github.com/HumoyunXujaev/logit-backend/ cd logit_backend \`\`\` 2. Create virtual environment: \`\`\`bash python -m venv venv source venv/bin/activate # Linux/Mac venv\Scripts\activate # Windows \`\`\` 3. Install dependencies: \`\`\`bash pip install -r requirements.txt \`\`\` 4. Create .env: \`\`\`env DJANGO_SECRET_KEY=your_secret_key DJANGO_DEBUG=True TELEGRAM_BOT_TOKEN=your_telegram_bot_token POSTGRES_DB=logit_db POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_HOST=localhost POSTGRES_PORT=5432 \`\`\` 5. Run migrations: \`\`\`bash python manage.py makemigrations \`\`\` \`\`\`bash python manage.py migrate \`\`\` 6. Start development server: \`\`\`bash python manage.py runserver \`\`\` ## 🏗 Project Structure ### Backend Structure \`\`\` ├── cargo/ # Cargo management ├── vehicles/ # Vehicle management ├── users/ # User management ├── core/ # Core functionality └── logit_backend/ # Project settings \`\`\` ## 🚀 Features In Detail ### User Registration Flow 1. User opens Telegram bot 2. Selects language preference 3. Chooses user type (Individual/Legal Entity) 4. Selects role (Carrier/Cargo Owner/etc.) 5. Fills profile information 6. Uploads required documents 7. Awaits verification (if required) ### Cargo Management Flow 1. Cargo owner creates cargo listing 2. System processes and validates cargo information 3. Students can view and manage cargo listings 4. Students can match cargo with carriers 5. Carriers receive notification and can accept/reject 6. System tracks cargo status throughout delivery ### Vehicle Management Flow 1. Carrier registers vehicles 2. Uploads required documentation 3. System verifies vehicle information 4. Carrier can update vehicle availability 5. System matches vehicles with compatible cargo 6. Tracks vehicle status and documents expiry ### Student Learning Flow 1. Student registers with group information 2. Gets assigned to mentor 3. Can view and practice with real cargo listings 4. Manages cargo-carrier matching 5. Receives feedback from mentors 6. Tracks learning progress ## 🔐 Security - JWT-based authentication - Role-based access control - Document verification system - Secure file uploads - HTTPS encryption - Input validation - Rate limiting - Session management ## 📱 Mobile Responsiveness The platform is fully responsive and optimized for: - Desktop browsers - Mobile devices - Telegram WebApp - Tablets ## 🌐 API Documentation API documentation is available at: - Swagger UI: `/api/docs/` - ReDoc: `/api/redoc/` ## 🤝 Contributing Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests. ## 📄 License This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details ## 👥 Team - Product Owner: [Name] - Lead Developer: [Name] - Backend Developer: [Name] - Frontend Developer: [Name] - UI/UX Designer: [Name] ## 📞 Support For support, please contact: - Email: support@logit.com - Telegram: @logit_support - Website: https://logit.com/support ## 🌟 Acknowledgments - Telegram for WebApp SDK - Shadcn for UI components - All contributors and testers ## 🗺 Roadmap ### Phase 1 (Current) - Core platform functionality - Basic cargo management - Vehicle registration - User authentication ### Phase 2 (Planned) - Advanced analytics - Mobile applications - Real-time tracking - Payment integration - AI-powered matching ### Phase 3 (Future) - International expansion - Blockchain integration - IoT device support - Advanced automation ## ⚙ Configuration ### Environment Variables #### Frontend \`\`\`env NEXT_PUBLIC_API_URL= NEXT_PUBLIC_TELEGRAM_BOT_TOKEN= \`\`\` #### Backend \`\`\`env DJANGO_SECRET_KEY= DJANGO_DEBUG= TELEGRAM_BOT_TOKEN= POSTGRES_DB= POSTGRES_USER= POSTGRES_PASSWORD= POSTGRES_HOST= POSTGRES_PORT= \`\`\` --- **Note**: This project is actively maintained and regularly updated. For the latest features and changes, please check the CHANGELOG.md file.
 ```
 
+# requirements.txt
+
+```txt
+amqp==5.3.1 anyio==4.8.0 asgiref==3.8.1 attrs==25.1.0 billiard==4.2.1 celery==5.4.0 certifi==2024.12.14 cffi==1.17.1 charset-normalizer==3.4.1 click==8.1.8 click-didyoumean==0.3.1 click-plugins==1.1.1 click-repl==0.3.0 colorama==0.4.6 cryptography==44.0.0 defusedxml==0.8.0rc2 Django==5.1.5 django-cors-headers==4.6.0 django-debug-toolbar==5.0.1 django-filter==24.3 django-simple-history==3.8.0 django-storages==1.14.4 djangorestframework==3.15.2 djangorestframework_simplejwt==5.4.0 djoser==2.3.1 drf-nested-routers==0.94.1 drf-spectacular==0.28.0 gunicorn==23.0.0 h11==0.14.0 httpcore==1.0.7 httpx==0.28.1 idna==3.10 inflection==0.5.1 iniconfig==2.0.0 jsonschema==4.23.0 jsonschema-specifications==2024.10.1 kombu==5.4.2 Markdown==3.7 oauthlib==3.2.2 packaging==24.2 pillow==11.1.0 pluggy==1.5.0 prompt_toolkit==3.0.50 psycopg2-binary==2.9.10 pycparser==2.22 PyJWT==2.10.1 pytest==8.3.4 python-dateutil==2.9.0.post0 python-dotenv==1.0.1 python-telegram-bot==21.10 python3-openid==3.2.0 pytz==2025.1 PyYAML==6.0.2 redis==5.2.1 referencing==0.36.2 requests==2.32.3 requests-oauthlib==2.0.0 rpds-py==0.22.3 six==1.17.0 sniffio==1.3.1 social-auth-app-django==5.4.2 social-auth-core==4.5.4 sqlparse==0.5.3 typing_extensions==4.12.2 tzdata==2025.1 uritemplate==4.1.1 urllib3==2.3.0 vine==5.1.0 wcwidth==0.2.13 whitenoise==6.8.2
+```
+
 # users\admin.py
 
 ```py
@@ -5497,9 +5618,49 @@ from django.contrib.auth.admin import UserAdmin
 from django.utils.translation import gettext_lazy as _
 from .models import User, UserDocument
 from django.utils.html import format_html
+from django import forms
+from django.contrib.auth.forms import ReadOnlyPasswordHashField
+
+class UserCreationForm(forms.ModelForm):
+    """A form for creating new users."""
+    password = forms.CharField(label='Password', widget=forms.PasswordInput, required=False)
+
+    class Meta:
+        model = User
+        fields = ('telegram_id', 'first_name', 'last_name', 'username', 'role', 'type')
+
+    def save(self, commit=True):
+        # Save the provided password in hashed format
+        user = super().save(commit=False)
+        if self.cleaned_data["password"]:
+            user.set_password(self.cleaned_data["password"])
+        else:
+            user.set_unusable_password()
+        if commit:
+            user.save()
+        return user
+
+# Создаем форму для изменения пользователя
+class UserChangeForm(forms.ModelForm):
+    """A form for updating users."""
+    password = ReadOnlyPasswordHashField(
+        label=_("Password"),
+        help_text=_(
+            "Raw passwords are not stored, so there is no way to see this "
+            "user's password, but you can change the password using "
+            "<a href=\"../password/\">this form</a>."
+        ),
+    )
+
+    class Meta:
+        model = User
+        fields = '__all__'
 
 @admin.register(User)
 class CustomUserAdmin(UserAdmin):
+    form = UserChangeForm
+    add_form = UserCreationForm
+    
     list_display = (
         'telegram_id', 'get_full_name', 'username', 'role',
         'type', 'rating', 'is_active', 'is_verified', 'tariff'
@@ -5518,7 +5679,7 @@ class CustomUserAdmin(UserAdmin):
         (None, {
             'fields': (
                 'telegram_id', 'first_name', 'last_name',
-                'username', 'language_code', 
+                'username', 'language_code', 'password'
             )
         }),
         (_('Profile'), {
@@ -5551,6 +5712,17 @@ class CustomUserAdmin(UserAdmin):
         }),
         (_('Important dates'), {
             'fields': ('last_login', 'date_joined')
+        }),
+    )
+    
+    add_fieldsets = (
+        (None, {
+            'classes': ('wide',),
+            'fields': (
+                'telegram_id', 'first_name', 'last_name', 'username',
+                'password', 'type', 'role', 'preferred_language',
+                'is_active', 'is_staff', 'is_verified'
+            ),
         }),
     )
     
@@ -6402,6 +6574,22 @@ class UserViewSet(viewsets.GenericViewSet):
         documents = UserDocument.objects.filter(user=request.user)
         serializer = UserDocumentSerializer(documents, many=True)
         return Response(serializer.data)
+    
+
+    # delete document endpoint
+    @extend_schema(
+        description='Delete user document',
+        parameters=[OpenApiParameter(name='document_id', type=int)],
+        responses={200: {'description': 'Document deleted successfully'}}
+    )
+    @action(detail=False, methods=['delete'], url_path='documents/(?P<document_id>[^/.]+)')
+    def delete_document(self, request, document_id=None):
+        """Delete a user document"""
+        document = UserDocument.objects.get(id=document_id)
+        document.delete()
+        
+        return Response({'detail': 'Document deleted successfully'})
+
 
     @extend_schema(
         description='Verify user',

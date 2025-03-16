@@ -22,7 +22,8 @@ from .serializers import (
     CarrierRequestCreateSerializer,
     CarrierRequestUpdateSerializer,
     ManagerCargoUpdateSerializer,
-    ExternalCargoCreateSerializer
+    ExternalCargoCreateSerializer,
+    CargoApprovalSerializer
 )
 from .filters import CargoFilter
 from core.permissions import (
@@ -605,6 +606,8 @@ class CargoViewSet(viewsets.ModelViewSet):
     def search(self, request):
         """Advanced cargo search"""
         queryset = self.get_queryset()
+        # print the whole request
+        print(request.query_params)
         
         # Apply text search
         q = request.query_params.get('q', '')

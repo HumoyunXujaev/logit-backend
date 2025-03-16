@@ -4,9 +4,49 @@ from django.contrib.auth.admin import UserAdmin
 from django.utils.translation import gettext_lazy as _
 from .models import User, UserDocument
 from django.utils.html import format_html
+from django import forms
+from django.contrib.auth.forms import ReadOnlyPasswordHashField
+
+class UserCreationForm(forms.ModelForm):
+    """A form for creating new users."""
+    password = forms.CharField(label='Password', widget=forms.PasswordInput, required=False)
+
+    class Meta:
+        model = User
+        fields = ('telegram_id', 'first_name', 'last_name', 'username', 'role', 'type')
+
+    def save(self, commit=True):
+        # Save the provided password in hashed format
+        user = super().save(commit=False)
+        if self.cleaned_data["password"]:
+            user.set_password(self.cleaned_data["password"])
+        else:
+            user.set_unusable_password()
+        if commit:
+            user.save()
+        return user
+
+# Создаем форму для изменения пользователя
+class UserChangeForm(forms.ModelForm):
+    """A form for updating users."""
+    password = ReadOnlyPasswordHashField(
+        label=_("Password"),
+        help_text=_(
+            "Raw passwords are not stored, so there is no way to see this "
+            "user's password, but you can change the password using "
+            "<a href=\"../password/\">this form</a>."
+        ),
+    )
+
+    class Meta:
+        model = User
+        fields = '__all__'
 
 @admin.register(User)
 class CustomUserAdmin(UserAdmin):
+    form = UserChangeForm
+    add_form = UserCreationForm
+    
     list_display = (
         'telegram_id', 'get_full_name', 'username', 'role',
         'type', 'rating', 'is_active', 'is_verified', 'tariff'
@@ -25,7 +65,7 @@ class CustomUserAdmin(UserAdmin):
         (None, {
             'fields': (
                 'telegram_id', 'first_name', 'last_name',
-                'username', 'language_code', 
+                'username', 'language_code', 'password'
             )
         }),
         (_('Profile'), {
@@ -58,6 +98,17 @@ class CustomUserAdmin(UserAdmin):
         }),
         (_('Important dates'), {
             'fields': ('last_login', 'date_joined')
+        }),
+    )
+    
+    add_fieldsets = (
+        (None, {
+            'classes': ('wide',),
+            'fields': (
+                'telegram_id', 'first_name', 'last_name', 'username',
+                'password', 'type', 'role', 'preferred_language',
+                'is_active', 'is_staff', 'is_verified'
+            ),
         }),
     )
     
